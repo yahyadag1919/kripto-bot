@@ -25,8 +25,14 @@ COINS = [
     "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "AVAX", "LINK", "ADA", "SUI",
     "DOT", "TRX", "ATOM", "NEAR", "TON", "LTC", "BCH", "ETC", "FIL", "APT",
     "ARB", "OP", "INJ", "SEI", "ICP", "HBAR", "VET", "ALGO", "XLM", "EOS",
-    "XTZ", "SAND", "MANA", "AAVE", "UNI", "MKR", "CRV", "GRT", "THETA", "EGLD",
-    "FLOW", "CHZ", "KAVA", "DYDX", "GALA", "IMX", "RUNE", "KAS", "ONDO", "WLD",
+    "XTZ", "SAND", "MANA", "AAVE", "UNI", "CRV", "GRT", "THETA", "EGLD",
+    "FLOW", "CHZ", "DYDX", "GALA", "IMX", "ONDO", "WLD",
+    "PEPE", "SHIB", "TIA", "STRK", "JUP", "PYTH", "JTO", "ENA", "ETHFI", "ORDI",
+    "BLUR", "LDO", "RPL", "FXS", "SSV", "CFX", "WOO", "GMX", "ZRX", "BAT",
+    "ENJ", "ZIL", "KDA", "ROSE", "ANKR", "CELO", "IOTA", "IOTX", "QTUM", "1INCH",
+    "COMP", "SNX", "YFI", "BAL", "STORJ", "OCEAN", "MASK", "LRC", "GMT", "APE",
+    "RSR", "SKL", "CTSI", "MTL", "DENT", "HOT", "RVN", "ICX", "ONT", "WAVES",
+    "KSM", "ZEC", "DASH", "MINA",
 ]
 
 # OKX perpetual swap sembol formati
@@ -37,8 +43,8 @@ TIMEFRAME = "15m"
 CHECK_INTERVAL_MINUTES = 15
 
 # Grup A (fiyat bazli tukenme kapisi) esikleri - hepsi tutmali
-EXHAUSTION_WICK_RATIO = 0.5
-EXHAUSTION_VOLUME_RATIO = 2.5
+EXHAUSTION_WICK_RATIO = 0.4
+EXHAUSTION_VOLUME_RATIO = 2.0
 RSI_PERIOD = 6
 RSI_LOW = 20
 RSI_HIGH = 80
@@ -65,6 +71,7 @@ exchange = ccxt.okx({
 
 # Bellek ici OI takibi (surekli calisan process icin, restart'ta sifirlanir)
 _last_oi = {}
+_unsupported_symbols = set()
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +405,8 @@ def scan_once():
         btc_df15 = None
 
     for symbol in WATCHLIST:
+        if symbol in _unsupported_symbols:
+            continue
         try:
             df = fetch_ohlcv_df(symbol, TIMEFRAME, limit=100)
             df = compute_indicators(df)
@@ -456,7 +465,11 @@ def scan_once():
                 print(f"{symbol}: kapi gecti ama skor dusuk ({score}/{MAX_CONFIRMATION_SCORE})")
 
         except Exception as e:
-            print(f"{symbol} hata: {e}")
+            if "does not have" in str(e).lower():
+                _unsupported_symbols.add(symbol)
+                print(f"{symbol}: bu borsada islem gormuyor, listeden cikarildi")
+            else:
+                print(f"{symbol} hata: {e}")
 
 
 def run_forever():
