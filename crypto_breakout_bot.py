@@ -33,6 +33,15 @@ COINS = [
     "COMP", "SNX", "YFI", "BAL", "STORJ", "OCEAN", "MASK", "LRC", "GMT", "APE",
     "RSR", "SKL", "CTSI", "MTL", "DENT", "HOT", "RVN", "ICX", "ONT", "WAVES",
     "KSM", "ZEC", "DASH", "MINA",
+    # Ek genisletme - L1/L2, AI, DeFi, oyun, meme
+    "ARKM", "AR", "RENDER", "AKT", "FET", "AGIX", "TAO", "NOT", "DOGS",
+    "FLOKI", "BONK", "WIF", "BOME", "MEME", "TURBO", "1000SATS", "PENDLE",
+    "ENS", "API3", "BAND", "UMA", "REN", "KNC", "SUSHI", "CAKE", "JOE", "RAY",
+    "SRM", "ALPHA", "BADGER", "ALCX", "TRB", "OXT", "NKN", "CTK", "COTI",
+    "ARPA", "LIT", "DUSK", "PERP", "MDT", "POLYX", "POWR", "REQ", "STMX",
+    "STPT", "TLM", "ALICE", "AXS", "SLP", "ILV", "YGG", "MAGIC", "PRIME",
+    "SUPER", "GHST", "AUDIO", "RLC", "NMR", "ORCA", "RAD", "GLMR", "MOVR",
+    "ASTR", "ACA", "PHA", "KLAY", "ONE", "FTM", "METIS", "BOBA", "CELR",
 ]
 
 # OKX perpetual swap sembol formati
@@ -42,12 +51,21 @@ BTC_SYMBOL = "BTC/USDT:USDT"
 TIMEFRAME = "15m"
 CHECK_INTERVAL_MINUTES = 15
 
-# Grup A (fiyat bazli tukenme kapisi) esikleri - hepsi tutmali
-EXHAUSTION_WICK_RATIO = 0.4
-EXHAUSTION_VOLUME_RATIO = 2.0
+# Grup A (fiyat bazli tukenme kapisi) esikleri - SIKI (altin) seviye
+STRICT_WICK_RATIO = 0.5
+STRICT_VOLUME_RATIO = 2.5
+STRICT_RSI_LOW = 20
+STRICT_RSI_HIGH = 80
+STRICT_MIN_SCORE = 4
+
+# Grup A esikleri - GEVSEK seviye
+LOOSE_WICK_RATIO = 0.3
+LOOSE_VOLUME_RATIO = 1.5
+LOOSE_RSI_LOW = 30
+LOOSE_RSI_HIGH = 70
+LOOSE_MIN_SCORE = 2
+
 RSI_PERIOD = 6
-RSI_LOW = 20
-RSI_HIGH = 80
 BOLLINGER_PERIOD = 20
 BOLLINGER_STD = 2
 
@@ -57,7 +75,6 @@ OI_CHANGE_MIN = 0.01           # OI %1'den fazla degisti mi
 ORDERBOOK_IMBALANCE_RATIO = 1.5
 BTC_DIVERGENCE_MULTIPLIER = 1.5  # coin hareketi BTC'nin en az bu kati kadar guclu olmali
 
-MIN_CONFIRMATION_SCORE = 4     # ek puanlarin toplami bu esigi gecerse sinyal gonderilir
 MAX_CONFIRMATION_SCORE = 8
 
 # Performans takibi - sinyalden sonra kac saat sonra kontrol edilecek
@@ -139,22 +156,32 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # Grup A: fiyat bazli tukenme kapisi (mandatory gate)
 # ---------------------------------------------------------------------------
 
-def check_exhaustion_gate(df: pd.DataFrame):
+def check_exhaustion_gate(df: pd.DataFrame, tier: str = "strict"):
     """
     Uc sart birden tutmali: hacim patlamasi + fitil + RSI asiri uc.
+    tier: "strict" (sıkı/altin) ya da "loose" (gevsek)
     Donus: (direction, row) ya da None
     """
     if len(df) < max(BOLLINGER_PERIOD, 20) + 2:
         return None
 
+    if tier == "strict":
+        wick_ratio, volume_ratio_min, rsi_low, rsi_high = (
+            STRICT_WICK_RATIO, STRICT_VOLUME_RATIO, STRICT_RSI_LOW, STRICT_RSI_HIGH
+        )
+    else:
+        wick_ratio, volume_ratio_min, rsi_low, rsi_high = (
+            LOOSE_WICK_RATIO, LOOSE_VOLUME_RATIO, LOOSE_RSI_LOW, LOOSE_RSI_HIGH
+        )
+
     row = df.iloc[-2]
     volume_ratio = row["volume"] / row["vol_sma15"] if row["vol_sma15"] else 0
-    if volume_ratio < EXHAUSTION_VOLUME_RATIO:
+    if volume_ratio < volume_ratio_min:
         return None
 
-    if row["lower_wick_ratio"] >= EXHAUSTION_WICK_RATIO and row["rsi"] <= RSI_LOW:
+    if row["lower_wick_ratio"] >= wick_ratio and row["rsi"] <= rsi_low:
         return "LONG", row
-    if row["upper_wick_ratio"] >= EXHAUSTION_WICK_RATIO and row["rsi"] >= RSI_HIGH:
+    if row["upper_wick_ratio"] >= wick_ratio and row["rsi"] >= rsi_high:
         return "SHORT", row
 
     return None
@@ -238,9 +265,9 @@ def score_multi_timeframe(symbol: str, direction: str) -> tuple:
         df1h = fetch_ohlcv_df(symbol, "1h", limit=30)
         df1h = compute_indicators(df1h)
         row = df1h.iloc[-2]
-        if direction == "LONG" and row["rsi"] <= RSI_LOW + 10:
+        if direction == "LONG" and row["rsi"] <= STRICT_RSI_LOW + 10:
             return 1, f"1h RSI {row['rsi']:.1f} (destekliyor)"
-        if direction == "SHORT" and row["rsi"] >= RSI_HIGH - 10:
+        if direction == "SHORT" and row["rsi"] >= STRICT_RSI_HIGH - 10:
             return 1, f"1h RSI {row['rsi']:.1f} (destekliyor)"
         return 0, f"1h RSI {row['rsi']:.1f} (notr)"
     except Exception as e:
@@ -289,16 +316,16 @@ PENDING_FILE = "pending_signals.csv"
 OUTCOME_FILE = "signal_outcomes.csv"
 
 
-def log_signal(symbol: str, direction: str, row, score: int, breakdown: list):
+def log_signal(symbol: str, direction: str, row, score: int, breakdown: list, tier: str = "strict"):
     file_exists = os.path.isfile(SIGNAL_LOG_FILE)
     with open(SIGNAL_LOG_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow([
-                "timestamp", "symbol", "direction", "price", "rsi", "score", "breakdown"
+                "timestamp", "symbol", "direction", "tier", "price", "rsi", "score", "breakdown"
             ])
         writer.writerow([
-            datetime.now().isoformat(), symbol, direction, row["close"],
+            datetime.now().isoformat(), symbol, direction, tier, row["close"],
             row["rsi"], score, " | ".join(breakdown)
         ])
 
@@ -410,13 +437,19 @@ def scan_once():
         try:
             df = fetch_ohlcv_df(symbol, TIMEFRAME, limit=100)
             df = compute_indicators(df)
-            gate_result = check_exhaustion_gate(df)
+
+            gate_result = check_exhaustion_gate(df, tier="strict")
+            tier = "strict"
+            if not gate_result:
+                gate_result = check_exhaustion_gate(df, tier="loose")
+                tier = "loose"
 
             if not gate_result:
                 print(f"{symbol}: kapi gecilmedi")
                 continue
 
             direction, row = gate_result
+            min_score = STRICT_MIN_SCORE if tier == "strict" else LOOSE_MIN_SCORE
 
             breakdown = []
             score = 0
@@ -446,12 +479,17 @@ def scan_once():
                 score += pts
                 breakdown.append(f"BTC karsilastirma: {note} ({pts:+d})")
 
-            log_signal(symbol, direction, row, score, breakdown)
+            log_signal(symbol, direction, row, score, breakdown, tier)
 
-            if score >= MIN_CONFIRMATION_SCORE:
+            if score >= min_score:
                 breakdown_text = "\n".join(f"- {b}" for b in breakdown)
+                if tier == "strict":
+                    baslik = f"🥇 {symbol} - SIKI TÜKENME sinyali ({direction} bounce)"
+                else:
+                    baslik = f"⚪ {symbol} - GEVŞEK tükenme sinyali ({direction} bounce)"
+
                 msg = (
-                    f"🎯 {symbol} - TÜKENME sinyali ({direction} bounce)\n"
+                    f"{baslik}\n"
                     f"Guven skoru: {score}/{MAX_CONFIRMATION_SCORE}\n\n"
                     f"Fiyat: {row['close']:.4f}\n"
                     f"RSI({RSI_PERIOD}): {row['rsi']:.1f}\n"
@@ -462,7 +500,7 @@ def scan_once():
                 send_telegram_message(msg)
                 log_pending(symbol, direction, row["close"], datetime.now())
             else:
-                print(f"{symbol}: kapi gecti ama skor dusuk ({score}/{MAX_CONFIRMATION_SCORE})")
+                print(f"{symbol}: {tier} kapi gecti ama skor dusuk ({score}/{MAX_CONFIRMATION_SCORE})")
 
         except Exception as e:
             if "does not have" in str(e).lower():
@@ -474,8 +512,10 @@ def scan_once():
 
 def run_forever():
     send_telegram_message(
-        "Kripto tukenme botu (coklu analiz) baslatildi.\n"
-        f"{len(WATCHLIST)} coin taranıyor, minimum guven skoru: {MIN_CONFIRMATION_SCORE}/{MAX_CONFIRMATION_SCORE}"
+        "Kripto tukenme botu (coklu analiz, 2 kademeli) baslatildi.\n"
+        f"{len(WATCHLIST)} coin taranıyor.\n"
+        f"🥇 Siki: skor >= {STRICT_MIN_SCORE}/{MAX_CONFIRMATION_SCORE}\n"
+        f"⚪ Gevsek: skor >= {LOOSE_MIN_SCORE}/{MAX_CONFIRMATION_SCORE}"
     )
     while True:
         scan_once()
