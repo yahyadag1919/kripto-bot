@@ -198,13 +198,14 @@ def check_exhaustion_gate(df: pd.DataFrame, tier: str = "strict"):
 # Piyasa yonu / 4 saatlik trend filtresi
 # ---------------------------------------------------------------------------
 
-def get_market_regime():
+def get_market_regime(symbol: str = None):
     """
-    BTC 4 saatlik grafigine bakarak genel piyasa yonunu belirler.
+    Verilen sembolun (varsayilan BTC) 4 saatlik grafigine bakarak trend yonunu belirler.
     Donus: (regime, gap_pct) - regime: 'GUCLU_DUSUS', 'GUCLU_YUKSELIS', 'YATAY'
     """
+    target = symbol or BTC_SYMBOL
     try:
-        df4h = fetch_ohlcv_df(BTC_SYMBOL, TREND_FILTER_TIMEFRAME, limit=60)
+        df4h = fetch_ohlcv_df(target, TREND_FILTER_TIMEFRAME, limit=60)
         df4h = compute_indicators(df4h)
         row = df4h.iloc[-2]
         gap_pct = (row["ema20"] - row["ema50"]) / row["ema50"] * 100
@@ -219,7 +220,7 @@ def get_market_regime():
             return "GUCLU_YUKSELIS", gap_pct
         return "YATAY", gap_pct
     except Exception as e:
-        print(f"Piyasa yonu alinamadi: {e}")
+        print(f"{target} icin trend alinamadi: {e}")
         return "BILINMIYOR", 0.0
 
 
@@ -555,12 +556,21 @@ def scan_once():
 
                 direction, exhaustion_row = gate_result
 
-                # Ters trend filtresi: guclu dusus trendinde LONG, guclu yukselis trendinde SHORT engellenir
+                # Ters trend filtresi: hem BTC genel piyasasina hem coin'in KENDI trendine bakilir.
+                # Coin, BTC yatay olsa bile kendi basina guclu bir trendde olabilir.
+                symbol_regime, symbol_gap = get_market_regime(symbol)
+
                 if direction == "LONG" and market_regime == "GUCLU_DUSUS":
-                    print(f"{symbol}: {tier} kapi gecti ama genel piyasa guclu dususte, LONG bounce engellendi")
+                    print(f"{symbol}: {tier} kapi gecti ama genel piyasa (BTC) guclu dususte, LONG bounce engellendi")
                     continue
                 if direction == "SHORT" and market_regime == "GUCLU_YUKSELIS":
-                    print(f"{symbol}: {tier} kapi gecti ama genel piyasa guclu yukseliste, SHORT bounce engellendi")
+                    print(f"{symbol}: {tier} kapi gecti ama genel piyasa (BTC) guclu yukseliste, SHORT bounce engellendi")
+                    continue
+                if direction == "LONG" and symbol_regime == "GUCLU_DUSUS":
+                    print(f"{symbol}: {tier} kapi gecti ama coin'in kendi 4h trendi guclu dususte ({symbol_gap:+.1f}%), LONG bounce engellendi")
+                    continue
+                if direction == "SHORT" and symbol_regime == "GUCLU_YUKSELIS":
+                    print(f"{symbol}: {tier} kapi gecti ama coin'in kendi 4h trendi guclu yukseliste ({symbol_gap:+.1f}%), SHORT bounce engellendi")
                     continue
 
                 _candidates[symbol] = {
