@@ -77,9 +77,15 @@ BTC_DIVERGENCE_MULTIPLIER = 1.5  # coin hareketi BTC'nin en az bu kati kadar guc
 
 MAX_CONFIRMATION_SCORE = 8
 
+# 4 saatlik piyasa yonu / trend filtresi
+TREND_FILTER_TIMEFRAME = "4h"
+TREND_EMA_GAP_THRESHOLD = 3.0     # EMA20 ve EMA50 arasindaki % fark bu esigi gecerse "guclu trend"
+TREND_CONSECUTIVE_CANDLES = 3     # son N 4h mumun cogunlugu ayni yonde olmali
+INVALIDATION_ATR_BUFFER = 0.3     # gecersizlik seviyesi icin ATR'nin bu orani kadar tampon
+
 # Performans takibi - sinyalden sonra kac saat sonra kontrol edilecek
-CHECK_HOURS = [1, 2, 4]
-SUCCESS_THRESHOLD_PCT = 0.3    # yon dogru ise en az bu kadar % hareket etmis olmali
+CHECK_MINUTES = [15, 30, 60]
+SUCCESS_THRESHOLD_PCT = 0.15   # yon dogru ise en az bu kadar % hareket etmis olmali
 
 exchange = ccxt.okx({
     "options": {"defaultType": "swap"},
@@ -185,6 +191,53 @@ def check_exhaustion_gate(df: pd.DataFrame, tier: str = "strict"):
         return "SHORT", row
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Piyasa yonu / 4 saatlik trend filtresi
+# ---------------------------------------------------------------------------
+
+def get_market_regime():
+    """
+    BTC 4 saatlik grafigine bakarak genel piyasa yonunu belirler.
+    Donus: (regime, gap_pct) - regime: 'GUCLU_DUSUS', 'GUCLU_YUKSELIS', 'YATAY'
+    """
+    try:
+        df4h = fetch_ohlcv_df(BTC_SYMBOL, TREND_FILTER_TIMEFRAME, limit=60)
+        df4h = compute_indicators(df4h)
+        row = df4h.iloc[-2]
+        gap_pct = (row["ema20"] - row["ema50"]) / row["ema50"] * 100
+
+        recent = df4h.iloc[-(TREND_CONSECUTIVE_CANDLES + 1):-1]
+        bearish_count = (~recent["is_bull"]).sum()
+        bullish_count = recent["is_bull"].sum()
+
+        if gap_pct <= -TREND_EMA_GAP_THRESHOLD and bearish_count >= TREND_CONSECUTIVE_CANDLES - 1:
+            return "GUCLU_DUSUS", gap_pct
+        if gap_pct >= TREND_EMA_GAP_THRESHOLD and bullish_count >= TREND_CONSECUTIVE_CANDLES - 1:
+            return "GUCLU_YUKSELIS", gap_pct
+        return "YATAY", gap_pct
+    except Exception as e:
+        print(f"Piyasa yonu alinamadi: {e}")
+        return "BILINMIYOR", 0.0
+
+
+def regime_label(regime: str) -> str:
+    return {
+        "GUCLU_DUSUS": "📉 Genel piyasa: GUCLU DUSUS",
+        "GUCLU_YUKSELIS": "📈 Genel piyasa: GUCLU YUKSELIS",
+        "YATAY": "➡️ Genel piyasa: YATAY/KARISIK",
+        "BILINMIYOR": "❓ Genel piyasa: bilinmiyor",
+    }.get(regime, "❓ Genel piyasa: bilinmiyor")
+
+
+def compute_invalidation(direction: str, row) -> float:
+    """Sinyali gecersiz sayacak / cikis referansi olacak fiyat seviyesi."""
+    atr = row["atr14"] if pd.notna(row["atr14"]) else 0
+    buffer = atr * INVALIDATION_ATR_BUFFER
+    if direction == "LONG":
+        return row["low"] - buffer
+    return row["high"] + buffer
 
 
 # ---------------------------------------------------------------------------
@@ -330,16 +383,16 @@ def log_signal(symbol: str, direction: str, row, score: int, breakdown: list, ti
         ])
 
 
-def log_pending(symbol: str, direction: str, entry_price: float, entry_time: datetime):
+def log_pending(symbol: str, direction: str, entry_price: float, entry_time: datetime, invalidation_price: float):
     file_exists = os.path.isfile(PENDING_FILE)
     with open(PENDING_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow([
-                "symbol", "direction", "entry_price", "entry_time",
-                "checked_1h", "checked_2h", "checked_4h"
+                "symbol", "direction", "entry_price", "entry_time", "invalidation_price",
+                "checked_15m", "checked_30m", "checked_60m"
             ])
-        writer.writerow([symbol, direction, entry_price, entry_time.isoformat(), "0", "0", "0"])
+        writer.writerow([symbol, direction, entry_price, entry_time.isoformat(), invalidation_price, "0", "0", "0"])
 
 
 def _read_pending():
@@ -350,24 +403,25 @@ def _read_pending():
 
 
 def _write_pending(rows):
-    fieldnames = ["symbol", "direction", "entry_price", "entry_time", "checked_1h", "checked_2h", "checked_4h"]
+    fieldnames = ["symbol", "direction", "entry_price", "entry_time", "invalidation_price",
+                  "checked_15m", "checked_30m", "checked_60m"]
     with open(PENDING_FILE, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
 
-def log_outcome(symbol, direction, entry_price, entry_time, hours, current_price, pct_change, success):
+def log_outcome(symbol, direction, entry_price, entry_time, minutes, current_price, pct_change, success):
     file_exists = os.path.isfile(OUTCOME_FILE)
     with open(OUTCOME_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow([
-                "symbol", "direction", "entry_price", "entry_time", "hours_after",
+                "symbol", "direction", "entry_price", "entry_time", "minutes_after",
                 "price_now", "pct_change", "success"
             ])
         writer.writerow([
-            symbol, direction, entry_price, entry_time, hours,
+            symbol, direction, entry_price, entry_time, minutes,
             current_price, f"{pct_change:.3f}", success
         ])
 
@@ -388,12 +442,12 @@ def check_pending_outcomes():
         direction = r["direction"]
 
         all_checked = True
-        for h in CHECK_HOURS:
-            flag_key = f"checked_{h}h"
+        for m in CHECK_MINUTES:
+            flag_key = f"checked_{m}m"
             if r.get(flag_key, "0") == "1":
                 continue
             all_checked = False
-            if now >= entry_time + timedelta(hours=h):
+            if now >= entry_time + timedelta(minutes=m):
                 try:
                     ticker = exchange.fetch_ticker(symbol)
                     current_price = ticker["last"]
@@ -404,7 +458,7 @@ def check_pending_outcomes():
                     else:
                         success = pct_change <= -SUCCESS_THRESHOLD_PCT
 
-                    log_outcome(symbol, direction, entry_price, r["entry_time"], h,
+                    log_outcome(symbol, direction, entry_price, r["entry_time"], m,
                                 current_price, pct_change, success)
                     r[flag_key] = "1"
                 except Exception as e:
@@ -431,6 +485,9 @@ def scan_once():
         print(f"BTC verisi alinamadi: {e}")
         btc_df15 = None
 
+    market_regime, regime_gap = get_market_regime()
+    print(f"Piyasa yonu: {market_regime} (EMA gap: {regime_gap:+.2f}%)")
+
     for symbol in WATCHLIST:
         if symbol in _unsupported_symbols:
             continue
@@ -449,6 +506,15 @@ def scan_once():
                 continue
 
             direction, row = gate_result
+
+            # Ters trend filtresi: guclu dusus trendinde LONG, guclu yukselis trendinde SHORT engellenir
+            if direction == "LONG" and market_regime == "GUCLU_DUSUS":
+                print(f"{symbol}: {tier} kapi gecti ama genel piyasa guclu dususte, LONG bounce engellendi")
+                continue
+            if direction == "SHORT" and market_regime == "GUCLU_YUKSELIS":
+                print(f"{symbol}: {tier} kapi gecti ama genel piyasa guclu yukseliste, SHORT bounce engellendi")
+                continue
+
             min_score = STRICT_MIN_SCORE if tier == "strict" else LOOSE_MIN_SCORE
 
             breakdown = []
@@ -483,6 +549,7 @@ def scan_once():
 
             if score >= min_score:
                 breakdown_text = "\n".join(f"- {b}" for b in breakdown)
+                invalidation = compute_invalidation(direction, row)
                 if tier == "strict":
                     baslik = f"🥇 {symbol} - SIKI TÜKENME sinyali ({direction} bounce)"
                 else:
@@ -490,15 +557,17 @@ def scan_once():
 
                 msg = (
                     f"{baslik}\n"
-                    f"Guven skoru: {score}/{MAX_CONFIRMATION_SCORE}\n\n"
+                    f"Guven skoru: {score}/{MAX_CONFIRMATION_SCORE}\n"
+                    f"{regime_label(market_regime)}\n\n"
                     f"Fiyat: {row['close']:.4f}\n"
+                    f"Gecersizlik seviyesi: {invalidation:.4f}\n"
                     f"RSI({RSI_PERIOD}): {row['rsi']:.1f}\n"
                     f"Zaman dilimi: {TIMEFRAME}\n\n"
                     f"Teyit detaylari:\n{breakdown_text}"
                 )
                 print(msg)
                 send_telegram_message(msg)
-                log_pending(symbol, direction, row["close"], datetime.now())
+                log_pending(symbol, direction, row["close"], datetime.now(), invalidation)
             else:
                 print(f"{symbol}: {tier} kapi gecti ama skor dusuk ({score}/{MAX_CONFIRMATION_SCORE})")
 
@@ -512,10 +581,12 @@ def scan_once():
 
 def run_forever():
     send_telegram_message(
-        "Kripto tukenme botu (coklu analiz, 2 kademeli) baslatildi.\n"
+        "Kripto tukenme botu (coklu analiz, 2 kademeli + trend filtresi) baslatildi.\n"
         f"{len(WATCHLIST)} coin taranıyor.\n"
         f"🥇 Siki: skor >= {STRICT_MIN_SCORE}/{MAX_CONFIRMATION_SCORE}\n"
-        f"⚪ Gevsek: skor >= {LOOSE_MIN_SCORE}/{MAX_CONFIRMATION_SCORE}"
+        f"⚪ Gevsek: skor >= {LOOSE_MIN_SCORE}/{MAX_CONFIRMATION_SCORE}\n"
+        f"Guclu trend varsa ters yon sinyali engellenir.\n"
+        f"Her sinyalde gecersizlik seviyesi ve genel piyasa yonu gosterilir."
     )
     while True:
         scan_once()
