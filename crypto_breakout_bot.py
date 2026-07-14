@@ -95,6 +95,7 @@ exchange = ccxt.okx({
 # Bellek ici OI takibi (surekli calisan process icin, restart'ta sifirlanir)
 _last_oi = {}
 _unsupported_symbols = set()
+_candidates = {}  # tukenme adaylari - onay mumu bekleniyor
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +239,40 @@ def compute_invalidation(direction: str, row) -> float:
     if direction == "LONG":
         return row["low"] - buffer
     return row["high"] + buffer
+
+
+# ---------------------------------------------------------------------------
+# Onay mumu mekanizmasi
+# ---------------------------------------------------------------------------
+
+def check_candidate_confirmation(symbol: str, df: pd.DataFrame):
+    """
+    Bu sembol icin bekleyen bir tukenme adayi varsa, en son kapanan mumun
+    beklenen yonde kapanip kapanmadigina bakar.
+    Donus: None (aday yok ya da henuz yeni mum kapanmadi)
+           ("confirmed", direction, tier, confirm_row, exhaustion_row)
+           ("rejected", direction, tier, confirm_row, exhaustion_row)
+    """
+    candidate = _candidates.get(symbol)
+    if not candidate:
+        return None
+
+    latest_row = df.iloc[-2]
+    if latest_row["timestamp"] <= candidate["candle_time"]:
+        return None  # henuz yeni mum kapanmadi, beklemeye devam
+
+    direction = candidate["direction"]
+    tier = candidate["tier"]
+    exhaustion_row = candidate["exhaustion_row"]
+    del _candidates[symbol]  # tek seferlik: onaylansa da reddedilse de aday tuketildi
+
+    confirmed = (
+        (direction == "LONG" and bool(latest_row["is_bull"])) or
+        (direction == "SHORT" and not bool(latest_row["is_bull"]))
+    )
+
+    status = "confirmed" if confirmed else "rejected"
+    return (status, direction, tier, latest_row, exhaustion_row)
 
 
 # ---------------------------------------------------------------------------
@@ -495,24 +530,46 @@ def scan_once():
             df = fetch_ohlcv_df(symbol, TIMEFRAME, limit=100)
             df = compute_indicators(df)
 
-            gate_result = check_exhaustion_gate(df, tier="strict")
-            tier = "strict"
-            if not gate_result:
-                gate_result = check_exhaustion_gate(df, tier="loose")
-                tier = "loose"
+            confirmation = check_candidate_confirmation(symbol, df)
 
-            if not gate_result:
-                print(f"{symbol}: kapi gecilmedi")
-                continue
+            if confirmation is not None:
+                status, direction, tier, confirm_row, exhaustion_row = confirmation
 
-            direction, row = gate_result
+                if status == "rejected":
+                    print(f"{symbol}: {tier} aday onaylanmadi (beklenen yon {direction} degildi), iptal edildi")
+                    continue
 
-            # Ters trend filtresi: guclu dusus trendinde LONG, guclu yukselis trendinde SHORT engellenir
-            if direction == "LONG" and market_regime == "GUCLU_DUSUS":
-                print(f"{symbol}: {tier} kapi gecti ama genel piyasa guclu dususte, LONG bounce engellendi")
-                continue
-            if direction == "SHORT" and market_regime == "GUCLU_YUKSELIS":
-                print(f"{symbol}: {tier} kapi gecti ama genel piyasa guclu yukseliste, SHORT bounce engellendi")
+                # status == "confirmed" -> asagida puanlamaya devam edilecek
+                row = confirm_row
+
+            else:
+                gate_result = check_exhaustion_gate(df, tier="strict")
+                tier = "strict"
+                if not gate_result:
+                    gate_result = check_exhaustion_gate(df, tier="loose")
+                    tier = "loose"
+
+                if not gate_result:
+                    print(f"{symbol}: kapi gecilmedi")
+                    continue
+
+                direction, exhaustion_row = gate_result
+
+                # Ters trend filtresi: guclu dusus trendinde LONG, guclu yukselis trendinde SHORT engellenir
+                if direction == "LONG" and market_regime == "GUCLU_DUSUS":
+                    print(f"{symbol}: {tier} kapi gecti ama genel piyasa guclu dususte, LONG bounce engellendi")
+                    continue
+                if direction == "SHORT" and market_regime == "GUCLU_YUKSELIS":
+                    print(f"{symbol}: {tier} kapi gecti ama genel piyasa guclu yukseliste, SHORT bounce engellendi")
+                    continue
+
+                _candidates[symbol] = {
+                    "direction": direction,
+                    "tier": tier,
+                    "candle_time": exhaustion_row["timestamp"],
+                    "exhaustion_row": exhaustion_row,
+                }
+                print(f"{symbol}: {tier} tukenme adayi olustu ({direction}), onay mumu bekleniyor")
                 continue
 
             min_score = STRICT_MIN_SCORE if tier == "strict" else LOOSE_MIN_SCORE
@@ -549,7 +606,7 @@ def scan_once():
 
             if score >= min_score:
                 breakdown_text = "\n".join(f"- {b}" for b in breakdown)
-                invalidation = compute_invalidation(direction, row)
+                invalidation = compute_invalidation(direction, exhaustion_row)
                 if tier == "strict":
                     baslik = f"🥇 {symbol} - SIKI TÜKENME sinyali ({direction} bounce)"
                 else:
@@ -557,11 +614,12 @@ def scan_once():
 
                 msg = (
                     f"{baslik}\n"
+                    f"✅ Onay mumu ile teyit edildi\n"
                     f"Guven skoru: {score}/{MAX_CONFIRMATION_SCORE}\n"
                     f"{regime_label(market_regime)}\n\n"
-                    f"Fiyat: {row['close']:.4f}\n"
+                    f"Tukenme fiyati: {exhaustion_row['close']:.4f} (RSI {exhaustion_row['rsi']:.1f})\n"
+                    f"Onay/Giris fiyati: {row['close']:.4f}\n"
                     f"Gecersizlik seviyesi: {invalidation:.4f}\n"
-                    f"RSI({RSI_PERIOD}): {row['rsi']:.1f}\n"
                     f"Zaman dilimi: {TIMEFRAME}\n\n"
                     f"Teyit detaylari:\n{breakdown_text}"
                 )
@@ -569,7 +627,7 @@ def scan_once():
                 send_telegram_message(msg)
                 log_pending(symbol, direction, row["close"], datetime.now(), invalidation)
             else:
-                print(f"{symbol}: {tier} kapi gecti ama skor dusuk ({score}/{MAX_CONFIRMATION_SCORE})")
+                print(f"{symbol}: {tier} onaylandi ama skor dusuk ({score}/{MAX_CONFIRMATION_SCORE})")
 
         except Exception as e:
             if "does not have" in str(e).lower():
@@ -581,11 +639,12 @@ def scan_once():
 
 def run_forever():
     send_telegram_message(
-        "Kripto tukenme botu (coklu analiz, 2 kademeli + trend filtresi) baslatildi.\n"
+        "Kripto tukenme botu (coklu analiz, 2 kademeli + trend filtresi + onay mumu) baslatildi.\n"
         f"{len(WATCHLIST)} coin taranıyor.\n"
         f"🥇 Siki: skor >= {STRICT_MIN_SCORE}/{MAX_CONFIRMATION_SCORE}\n"
         f"⚪ Gevsek: skor >= {LOOSE_MIN_SCORE}/{MAX_CONFIRMATION_SCORE}\n"
         f"Guclu trend varsa ters yon sinyali engellenir.\n"
+        f"Tukenme tespit edilince hemen degil, bir sonraki mum onaylarsa sinyal gonderilir.\n"
         f"Her sinyalde gecersizlik seviyesi ve genel piyasa yonu gosterilir."
     )
     while True:
