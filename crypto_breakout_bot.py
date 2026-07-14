@@ -18,7 +18,11 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     )
 
 # ---------------------------------------------------------------------------
-# Ayarlar
+# STRATEJI: Trend takibi / momentum kirilimi (tersine bahis DEGIL)
+#
+# Eski sistem "fiyat asiri uca gitti, tersine doner" diye bahis oynuyordu.
+# Bu sistem tam tersi: "fiyat guclu ve teyitli bir kirilim yapti, kisa sure
+# bu yonde devam eder" diye giriyor. Trendin tersine degil, yaninda durur.
 # ---------------------------------------------------------------------------
 
 COINS = [
@@ -48,28 +52,30 @@ WATCHLIST = [f"{c}/USDT:USDT" for c in COINS]
 TIMEFRAME = "15m"
 CHECK_INTERVAL_MINUTES = 15
 
-# Tukenme kapisi esikleri (tek seviye - yuksek kalite, gevsek kademe kaldirildi)
-GATE_WICK_RATIO = 0.5
-GATE_VOLUME_RATIO = 2.5
-GATE_RSI_LOW = 20
-GATE_RSI_HIGH = 80
-
-RSI_PERIOD = 6
+RSI_PERIOD = 14
 ATR_PERIOD = 14
 
-# Onay mumu sonrasi ek "onay gucu" puanlamasi (0-4)
-MIN_CONFIRMATION_STRENGTH = 2
-MAX_CONFIRMATION_STRENGTH = 5
-ORDERBOOK_IMBALANCE_RATIO = 1.3
+# Kirilim (breakout) tanimi
+BREAKOUT_LOOKBACK = 20          # son N mumun en yuksek/dusuk kapanisini kirmali
+BREAKOUT_VOLUME_MULTIPLIER = 2.0
+BREAKOUT_BODY_ATR_MULTIPLIER = 0.6   # mum govdesi ATR'nin bu katindan buyuk olmali (kararli hareket)
+BREAKOUT_CLOSE_POSITION = 0.65        # mum kendi araliginin ust/alt %65'inde kapanmali (fitilli degil, guclu kapanis)
 
-# Gecersizlik seviyesi - 15m ATR'nin bu kati kadar tampon (hizli tutus icin makul genislikte)
-INVALIDATION_ATR_BUFFER = 1.2
+# RSI "momentum insa oluyor ama henuz tukenmedi" bolgesi
+LONG_RSI_MIN, LONG_RSI_MAX = 50, 78
+SHORT_RSI_MIN, SHORT_RSI_MAX = 22, 50
 
-# Senin islem tarzin: anlik giris, kisa tutus
+# Coin'in kendi 1h trendi kirilim yonunu desteklemeli (ya da en azindan karsi olmamali)
+TREND_FILTER_TIMEFRAME = "1h"
+TREND_EMA_GAP_THRESHOLD = 1.5   # bu esigin tersine guclu trend varsa kirilim reddedilir
+
+INVALIDATION_ATR_BUFFER = 1.0   # kirilim seviyesinin gerisine ATR'nin bu kati kadar tampon
+
+ORDERBOOK_IMBALANCE_RATIO = 1.2
+
 TARGET_HOLD_MINUTES = 20
 MAX_HOLD_MINUTES = 45
 
-# Performans takibi / hatirlatma zamanlari (dakika)
 CHECK_MINUTES = [15, 30, 45]
 SUCCESS_THRESHOLD_PCT = 0.15
 
@@ -79,8 +85,7 @@ exchange = ccxt.okx({
 })
 
 _unsupported_symbols = set()
-_candidates = {}   # tukenme adaylari - onay mumu bekleniyor
-_reminders = {}    # gonderilen sinyaller icin hatirlatma zamanlamasi
+_reminders = {}
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +113,9 @@ def fetch_ohlcv_df(symbol: str, timeframe: str, limit: int = 100):
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df["vol_sma15"] = df["volume"].rolling(15).mean()
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+    df["vol_sma20"] = df["volume"].rolling(20).mean()
 
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
@@ -119,6 +126,10 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["body"] = (df["close"] - df["open"]).abs()
     df["is_bull"] = df["close"] > df["open"]
 
+    candle_range = (df["high"] - df["low"]).replace(0, np.nan)
+    df["close_position"] = (df["close"] - df["low"]) / candle_range
+    df["close_position"] = df["close_position"].fillna(0.5)
+
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -128,152 +139,98 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["rsi"] = 100 - (100 / (1 + rs))
     df["rsi"] = df["rsi"].fillna(50)
 
-    candle_range = (df["high"] - df["low"]).replace(0, np.nan)
-    df["lower_wick_ratio"] = (df[["open", "close"]].min(axis=1) - df["low"]) / candle_range
-    df["upper_wick_ratio"] = (df["high"] - df[["open", "close"]].max(axis=1)) / candle_range
-    df["lower_wick_ratio"] = df["lower_wick_ratio"].fillna(0)
-    df["upper_wick_ratio"] = df["upper_wick_ratio"].fillna(0)
+    # Kirilim seviyeleri: SON mum haric onceki N mumun en yuksek/dusuk kapanisi
+    df["breakout_high"] = df["close"].shift(1).rolling(BREAKOUT_LOOKBACK).max()
+    df["breakout_low"] = df["close"].shift(1).rolling(BREAKOUT_LOOKBACK).min()
 
     return df
 
 
 # ---------------------------------------------------------------------------
-# Tukenme kapisi (mandatory gate)
+# Kirilim kapisi (mandatory gate) - trend YONUNDE giris
 # ---------------------------------------------------------------------------
 
-def check_exhaustion_gate(df: pd.DataFrame):
-    """Uc sart birden tutmali: hacim patlamasi + fitil + RSI asiri uc."""
-    if len(df) < 25:
+def check_breakout_gate(df: pd.DataFrame):
+    """
+    Son KAPANMIS muma bakar (df.iloc[-2]). Tum sartlar birden tutmali:
+      1. Kapanis, son N mumun en yuksek/dusuk kapanisini kirmis olmali
+      2. Hacim ortalamanin en az BREAKOUT_VOLUME_MULTIPLIER kati olmali
+      3. Mum govdesi ATR'ye gore guclu olmali (kararsiz/dojivari degil)
+      4. Mum kendi araliginin guclu tarafinda kapanmis olmali (fitil degil, gercek kirilim)
+      5. RSI "momentum insa oluyor" bolgesinde olmali (henuz asiri tukenmis degil)
+    """
+    if len(df) < BREAKOUT_LOOKBACK + 5:
         return None
 
     row = df.iloc[-2]
-    volume_ratio = row["volume"] / row["vol_sma15"] if row["vol_sma15"] else 0
-    if volume_ratio < GATE_VOLUME_RATIO:
+    if pd.isna(row["breakout_high"]) or pd.isna(row["breakout_low"]) or pd.isna(row["atr14"]):
         return None
 
-    if row["lower_wick_ratio"] >= GATE_WICK_RATIO and row["rsi"] <= GATE_RSI_LOW:
+    volume_ratio = row["volume"] / row["vol_sma20"] if row["vol_sma20"] else 0
+    if volume_ratio < BREAKOUT_VOLUME_MULTIPLIER:
+        return None
+
+    body_ratio = row["body"] / row["atr14"] if row["atr14"] > 0 else 0
+    if body_ratio < BREAKOUT_BODY_ATR_MULTIPLIER:
+        return None
+
+    # LONG: yukari kirilim
+    if (row["close"] > row["breakout_high"]
+            and row["close_position"] >= BREAKOUT_CLOSE_POSITION
+            and LONG_RSI_MIN <= row["rsi"] <= LONG_RSI_MAX):
         return "LONG", row
-    if row["upper_wick_ratio"] >= GATE_WICK_RATIO and row["rsi"] >= GATE_RSI_HIGH:
+
+    # SHORT: asagi kirilim
+    if (row["close"] < row["breakout_low"]
+            and row["close_position"] <= (1 - BREAKOUT_CLOSE_POSITION)
+            and SHORT_RSI_MIN <= row["rsi"] <= SHORT_RSI_MAX):
         return "SHORT", row
 
     return None
 
 
-# ---------------------------------------------------------------------------
-# Onay mumu mekanizmasi
-# ---------------------------------------------------------------------------
-
-def check_candidate_confirmation(symbol: str, df: pd.DataFrame):
-    """
-    Bekleyen bir tukenme adayi varsa, en son kapanan mumun beklenen yonde
-    kapanip kapanmadigina bakar.
-    Donus: None ya da (status, direction, confirm_row, exhaustion_row)
-    """
-    candidate = _candidates.get(symbol)
-    if not candidate:
-        return None
-
-    latest_row = df.iloc[-2]
-    if latest_row["timestamp"] <= candidate["candle_time"]:
-        return None
-
-    direction = candidate["direction"]
-    exhaustion_row = candidate["exhaustion_row"]
-    del _candidates[symbol]
-
-    confirmed = (
-        (direction == "LONG" and bool(latest_row["is_bull"])) or
-        (direction == "SHORT" and not bool(latest_row["is_bull"]))
-    )
-    status = "confirmed" if confirmed else "rejected"
-    return (status, direction, latest_row, exhaustion_row)
-
-
-# ---------------------------------------------------------------------------
-# Onay gucu puanlamasi - sadece HIZLI, ilgili veriler (yavas trend filtreleri yok)
-# ---------------------------------------------------------------------------
-
-def score_confirmation_strength(direction: str, confirm_row, exhaustion_row) -> tuple:
-    """
-    Onay mumunun gercekten guclu bir donusu mu yoksa zayif bir tepkimi
-    oldugunu olcer. Puanlar (0-4), her biri +1:
-      1. Onay mumunun govdesi ATR'ye gore guclu mu (kararli hareket)
-      2. Onay mumunun hacmi, tukenme mumunun hacminin en az %70'i mi (ilgi devam ediyor)
-      3. RSI, tukenme anindan beri anlamli sekilde toparlandi mi (momentum gercekten donuyor)
-      4. Fiyat, tukenme mumunun govde ortasini gecti mi (yarim kalan degil, tam donus)
-    """
-    score = 0
-    breakdown = []
-
-    atr = exhaustion_row["atr14"] if pd.notna(exhaustion_row["atr14"]) and exhaustion_row["atr14"] > 0 else None
-    if atr:
-        body_ratio = confirm_row["body"] / atr
-        if body_ratio >= 0.5:
-            score += 1
-            breakdown.append(f"Onay mumu govdesi guclu ({body_ratio:.2f}x ATR) (+1)")
-        else:
-            breakdown.append(f"Onay mumu govdesi zayif ({body_ratio:.2f}x ATR) (+0)")
-    else:
-        breakdown.append("ATR verisi yetersiz (+0)")
-
-    if exhaustion_row["volume"] > 0:
-        vol_ratio = confirm_row["volume"] / exhaustion_row["volume"]
-        if vol_ratio >= 0.7:
-            score += 1
-            breakdown.append(f"Hacim devam ediyor ({vol_ratio:.2f}x) (+1)")
-        else:
-            breakdown.append(f"Hacim zayifliyor ({vol_ratio:.2f}x) (+0)")
-    else:
-        breakdown.append("Hacim verisi yetersiz (+0)")
-
-    rsi_shift = confirm_row["rsi"] - exhaustion_row["rsi"]
-    if direction == "LONG" and rsi_shift >= 5:
-        score += 1
-        breakdown.append(f"RSI toparlaniyor ({rsi_shift:+.1f}) (+1)")
-    elif direction == "SHORT" and rsi_shift <= -5:
-        score += 1
-        breakdown.append(f"RSI geriliyor ({rsi_shift:+.1f}) (+1)")
-    else:
-        breakdown.append(f"RSI degisimi zayif ({rsi_shift:+.1f}) (+0)")
-
-    exhaustion_mid = (exhaustion_row["open"] + exhaustion_row["close"]) / 2
-    if direction == "LONG" and confirm_row["close"] > exhaustion_mid:
-        score += 1
-        breakdown.append("Fiyat tukenme mumunun govde ortasini gecti (+1)")
-    elif direction == "SHORT" and confirm_row["close"] < exhaustion_mid:
-        score += 1
-        breakdown.append("Fiyat tukenme mumunun govde ortasini gecti (+1)")
-    else:
-        breakdown.append("Fiyat henuz govde ortasini gecmedi (+0)")
-
-    return score, breakdown
+def get_symbol_trend(symbol: str):
+    """Coin'in kendi 1h trendine bakar. Kirilim bu trendin tersine olmamali."""
+    try:
+        df1h = fetch_ohlcv_df(symbol, TREND_FILTER_TIMEFRAME, limit=60)
+        df1h = compute_indicators(df1h)
+        row = df1h.iloc[-2]
+        if pd.isna(row["ema50"]) or row["ema50"] == 0:
+            return "BILINMIYOR", 0.0
+        gap_pct = (row["ema20"] - row["ema50"]) / row["ema50"] * 100
+        if gap_pct <= -TREND_EMA_GAP_THRESHOLD:
+            return "DUSUS", gap_pct
+        if gap_pct >= TREND_EMA_GAP_THRESHOLD:
+            return "YUKSELIS", gap_pct
+        return "YATAY", gap_pct
+    except Exception as e:
+        print(f"{symbol} icin 1h trend alinamadi: {e}")
+        return "BILINMIYOR", 0.0
 
 
 def score_orderbook(symbol: str, direction: str) -> tuple:
-    """Emir defterinde anlik alici/satici baskisi yonu destekliyor mu (hizli giris icin onemli)."""
     try:
         ob = exchange.fetch_order_book(symbol, limit=20)
         bid_vol = sum(b[1] for b in ob["bids"])
         ask_vol = sum(a[1] for a in ob["asks"])
         if ask_vol == 0 or bid_vol == 0:
-            return 0, "veri yetersiz"
-
+            return False, "veri yetersiz"
         ratio = bid_vol / ask_vol
         if direction == "LONG" and ratio >= ORDERBOOK_IMBALANCE_RATIO:
-            return 1, f"bid/ask {ratio:.2f} (alici agirlikli, destekliyor)"
+            return True, f"bid/ask {ratio:.2f} (alici agirlikli, destekliyor)"
         if direction == "SHORT" and ratio <= 1 / ORDERBOOK_IMBALANCE_RATIO:
-            return 1, f"bid/ask {ratio:.2f} (satici agirlikli, destekliyor)"
-        return 0, f"bid/ask {ratio:.2f} (destek yok)"
+            return True, f"bid/ask {ratio:.2f} (satici agirlikli, destekliyor)"
+        return False, f"bid/ask {ratio:.2f} (notr)"
     except Exception as e:
-        return 0, f"order book alinamadi ({e})"
+        return False, f"order book alinamadi ({e})"
 
 
 def compute_invalidation(direction: str, row) -> float:
     atr = row["atr14"] if pd.notna(row["atr14"]) else 0
     buffer = atr * INVALIDATION_ATR_BUFFER
     if direction == "LONG":
-        return row["low"] - buffer
-    return row["high"] + buffer
+        return row["breakout_high"] - buffer
+    return row["breakout_low"] + buffer
 
 
 # ---------------------------------------------------------------------------
@@ -285,15 +242,14 @@ PENDING_FILE = "pending_signals.csv"
 OUTCOME_FILE = "signal_outcomes.csv"
 
 
-def log_signal(symbol: str, direction: str, row, score: int, breakdown: list):
+def log_signal(symbol: str, direction: str, row, breakdown: list):
     file_exists = os.path.isfile(SIGNAL_LOG_FILE)
     with open(SIGNAL_LOG_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(["timestamp", "symbol", "direction", "price", "rsi", "score", "breakdown"])
+            writer.writerow(["timestamp", "symbol", "direction", "price", "rsi", "breakdown"])
         writer.writerow([
-            datetime.now().isoformat(), symbol, direction, row["close"],
-            row["rsi"], score, " | ".join(breakdown)
+            datetime.now().isoformat(), symbol, direction, row["close"], row["rsi"], " | ".join(breakdown)
         ])
 
 
@@ -335,55 +291,47 @@ def log_outcome(symbol, direction, entry_price, entry_time, minutes, current_pri
                 "price_now", "pct_change", "success"
             ])
         writer.writerow([
-            symbol, direction, entry_price, entry_time, minutes,
-            current_price, f"{pct_change:.3f}", success
+            symbol, direction, entry_price, entry_time, minutes, current_price, f"{pct_change:.3f}", success
         ])
 
 
 def check_pending_outcomes():
-    """Bekleyen sinyalleri kontrol eder; 15/30/45 dk'da sonucu loglar, 20 dk'da hatirlatma gonderir."""
     rows = _read_pending()
     if not rows:
-        return
+        pass
+    else:
+        now = datetime.now()
+        still_pending = []
+        for r in rows:
+            entry_time = datetime.fromisoformat(r["entry_time"])
+            entry_price = float(r["entry_price"])
+            symbol = r["symbol"]
+            direction = r["direction"]
+            all_checked = True
+            for m in CHECK_MINUTES:
+                flag_key = f"checked_{m}m"
+                if r.get(flag_key, "0") == "1":
+                    continue
+                all_checked = False
+                if now >= entry_time + timedelta(minutes=m):
+                    try:
+                        ticker = exchange.fetch_ticker(symbol)
+                        current_price = ticker["last"]
+                        pct_change = (current_price - entry_price) / entry_price * 100
+                        if direction == "LONG":
+                            success = pct_change >= SUCCESS_THRESHOLD_PCT
+                        else:
+                            success = pct_change <= -SUCCESS_THRESHOLD_PCT
+                        log_outcome(symbol, direction, entry_price, r["entry_time"], m,
+                                    current_price, pct_change, success)
+                        r[flag_key] = "1"
+                    except Exception as e:
+                        print(f"{symbol} sonuc kontrolu hatasi: {e}")
+            if not all_checked:
+                still_pending.append(r)
+        _write_pending(still_pending)
 
     now = datetime.now()
-    still_pending = []
-
-    for r in rows:
-        entry_time = datetime.fromisoformat(r["entry_time"])
-        entry_price = float(r["entry_price"])
-        symbol = r["symbol"]
-        direction = r["direction"]
-
-        all_checked = True
-        for m in CHECK_MINUTES:
-            flag_key = f"checked_{m}m"
-            if r.get(flag_key, "0") == "1":
-                continue
-            all_checked = False
-            if now >= entry_time + timedelta(minutes=m):
-                try:
-                    ticker = exchange.fetch_ticker(symbol)
-                    current_price = ticker["last"]
-                    pct_change = (current_price - entry_price) / entry_price * 100
-
-                    if direction == "LONG":
-                        success = pct_change >= SUCCESS_THRESHOLD_PCT
-                    else:
-                        success = pct_change <= -SUCCESS_THRESHOLD_PCT
-
-                    log_outcome(symbol, direction, entry_price, r["entry_time"], m,
-                                current_price, pct_change, success)
-                    r[flag_key] = "1"
-                except Exception as e:
-                    print(f"{symbol} sonuc kontrolu hatasi: {e}")
-
-        if not all_checked:
-            still_pending.append(r)
-
-    _write_pending(still_pending)
-
-    # Hedef tutus suresi (~20 dk) hatirlatmasi - senin islem tarzina ozel
     still_reminding = {}
     for symbol, info in _reminders.items():
         if now >= info["remind_at"]:
@@ -394,10 +342,10 @@ def check_pending_outcomes():
                 if info["direction"] == "SHORT":
                     pct_change = -pct_change
                 msg = (
-                    f"⏰ {symbol} - hedef sure doldu (~{TARGET_HOLD_MINUTES} dk)\n"
-                    f"Giris: {info['entry_price']:.4f} | Simdi: {current_price:.4f}\n"
-                    f"Yondeki degisim: {pct_change:+.2f}%\n\n"
-                    f"Pozisyonu gozden gecirme zamani (en fazla {MAX_HOLD_MINUTES} dk kuralin)."
+                    f"⏰ {symbol} - hedef süre doldu (~{TARGET_HOLD_MINUTES} dk)\n"
+                    f"Giriş: {info['entry_price']:.4f} | Şimdi: {current_price:.4f}\n"
+                    f"Yöndeki değişim: {pct_change:+.2f}%\n\n"
+                    f"Pozisyonu gözden geçirme zamanı (en fazla {MAX_HOLD_MINUTES} dk kuralın)."
                 )
                 send_telegram_message(msg)
             except Exception as e:
@@ -424,62 +372,55 @@ def scan_once():
             df = fetch_ohlcv_df(symbol, TIMEFRAME, limit=100)
             df = compute_indicators(df)
 
-            confirmation = check_candidate_confirmation(symbol, df)
-
-            if confirmation is not None:
-                status, direction, confirm_row, exhaustion_row = confirmation
-
-                if status == "rejected":
-                    print(f"{symbol}: aday onaylanmadi (beklenen yon {direction} degildi), iptal edildi")
-                    continue
-
-                score, breakdown = score_confirmation_strength(direction, confirm_row, exhaustion_row)
-                pts, note = score_orderbook(symbol, direction)
-                score += pts
-                breakdown.append(f"Order book: {note} ({pts:+d})")
-
-                log_signal(symbol, direction, confirm_row, score, breakdown)
-
-                if score >= MIN_CONFIRMATION_STRENGTH:
-                    invalidation = compute_invalidation(direction, exhaustion_row)
-                    yon_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
-                    breakdown_text = "\n".join(f"- {b}" for b in breakdown)
-
-                    msg = (
-                        f"{yon_emoji} {symbol} - TÜKENME sinyali (bounce)\n"
-                        f"✅ Onay mumu ile teyit edildi\n"
-                        f"Onay gücü: {score}/{MAX_CONFIRMATION_STRENGTH}\n\n"
-                        f"Tükenme fiyatı: {exhaustion_row['close']:.4f} (RSI {exhaustion_row['rsi']:.1f})\n"
-                        f"Onay/Giriş fiyatı: {confirm_row['close']:.4f}\n"
-                        f"Geçersizlik seviyesi: {invalidation:.4f}\n\n"
-                        f"⏱ Hedef tutuş: ~{TARGET_HOLD_MINUTES} dk | En fazla: {MAX_HOLD_MINUTES} dk\n\n"
-                        f"Teyit detayları:\n{breakdown_text}"
-                    )
-                    print(msg)
-                    send_telegram_message(msg)
-                    log_pending(symbol, direction, confirm_row["close"], datetime.now(), invalidation)
-                    _reminders[symbol] = {
-                        "entry_price": confirm_row["close"],
-                        "direction": direction,
-                        "remind_at": datetime.now() + timedelta(minutes=TARGET_HOLD_MINUTES),
-                    }
-                else:
-                    print(f"{symbol}: onaylandi ama onay gucu dusuk ({score}/{MAX_CONFIRMATION_STRENGTH})")
-
-                continue
-
-            gate_result = check_exhaustion_gate(df)
+            gate_result = check_breakout_gate(df)
             if not gate_result:
-                print(f"{symbol}: kapi gecilmedi")
+                print(f"{symbol}: kirilim yok")
                 continue
 
-            direction, exhaustion_row = gate_result
-            _candidates[symbol] = {
+            direction, row = gate_result
+
+            symbol_trend, trend_gap = get_symbol_trend(symbol)
+            if direction == "LONG" and symbol_trend == "DUSUS":
+                print(f"{symbol}: LONG kirilim var ama 1h trend dususte ({trend_gap:+.1f}%), reddedildi")
+                continue
+            if direction == "SHORT" and symbol_trend == "YUKSELIS":
+                print(f"{symbol}: SHORT kirilim var ama 1h trend yukseliste ({trend_gap:+.1f}%), reddedildi")
+                continue
+
+            breakdown = [
+                f"✅ Kırılım seviyesi: {row['breakout_high' if direction == 'LONG' else 'breakout_low']:.4f}",
+                f"✅ Hacim {row['volume']/row['vol_sma20']:.2f}x ortalama",
+                f"✅ Mum gövdesi {row['body']/row['atr14']:.2f}x ATR",
+                f"✅ Kapanış konumu: {row['close_position']:.2f}",
+                f"✅ RSI: {row['rsi']:.1f} (momentum bölgesinde)",
+                f"{'✅' if symbol_trend != 'BILINMIYOR' else '➖'} 1h trend: {symbol_trend} ({trend_gap:+.1f}%)",
+            ]
+
+            ob_support, ob_note = score_orderbook(symbol, direction)
+            breakdown.append(f"{'✅' if ob_support else '➖'} Order book: {ob_note}")
+
+            log_signal(symbol, direction, row, breakdown)
+
+            invalidation = compute_invalidation(direction, row)
+            yon_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+            breakdown_text = "\n".join(f"- {b}" for b in breakdown)
+
+            msg = (
+                f"{yon_emoji} {symbol} - MOMENTUM KIRILIMI\n"
+                f"(trend yönünde giriş, tersine bahis değil)\n\n"
+                f"Giriş fiyatı: {row['close']:.4f}\n"
+                f"Geçersizlik seviyesi: {invalidation:.4f}\n\n"
+                f"⏱ Hedef tutuş: ~{TARGET_HOLD_MINUTES} dk | En fazla: {MAX_HOLD_MINUTES} dk\n\n"
+                f"Teyit detayları:\n{breakdown_text}"
+            )
+            print(msg)
+            send_telegram_message(msg)
+            log_pending(symbol, direction, row["close"], datetime.now(), invalidation)
+            _reminders[symbol] = {
+                "entry_price": row["close"],
                 "direction": direction,
-                "candle_time": exhaustion_row["timestamp"],
-                "exhaustion_row": exhaustion_row,
+                "remind_at": datetime.now() + timedelta(minutes=TARGET_HOLD_MINUTES),
             }
-            print(f"{symbol}: tukenme adayi olustu ({direction}), onay mumu bekleniyor")
 
         except Exception as e:
             if "does not have" in str(e).lower():
@@ -491,10 +432,11 @@ def scan_once():
 
 def run_forever():
     send_telegram_message(
-        "Kripto tükenme botu (hızlı işlem sürümü) başlatıldı.\n"
-        f"{len(WATCHLIST)} coin taranıyor.\n"
-        f"Minimum onay gücü: {MIN_CONFIRMATION_STRENGTH}/{MAX_CONFIRMATION_STRENGTH}\n"
-        f"Tükenme tespit edilince hemen değil, bir sonraki mum onaylarsa sinyal gönderilir.\n"
+        "Kripto MOMENTUM botu (trend takibi) başlatıldı.\n"
+        f"{len(WATCHLIST)} coin taranıyor.\n\n"
+        "Strateji değişti: artık tersine bahis değil, trend yönünde giriş yapılıyor.\n"
+        f"Kırılım şartları: hacim {BREAKOUT_VOLUME_MULTIPLIER}x+, güçlü gövde, güçlü kapanış, "
+        "RSI momentum bölgesinde, coin'in kendi 1h trendi karşı yönde olmamalı.\n\n"
         f"Hedef tutuş: ~{TARGET_HOLD_MINUTES} dk, en fazla {MAX_HOLD_MINUTES} dk — "
         f"{TARGET_HOLD_MINUTES}. dakikada otomatik hatırlatma gelecek."
     )
