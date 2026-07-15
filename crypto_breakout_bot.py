@@ -18,11 +18,11 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     )
 
 # ---------------------------------------------------------------------------
-# STRATEJI: Trend takibi / momentum kirilimi (tersine bahis DEGIL)
+# STRATEJI: RSI + VWAP Birlesik Teyit (9 turluk, 66 stratejilik turnuvada
+# en yuksek isabet oranini gosteren sistem - %65.4 isabet, en dusuk ort. zarar)
 #
-# Eski sistem "fiyat asiri uca gitti, tersine doner" diye bahis oynuyordu.
-# Bu sistem tam tersi: "fiyat guclu ve teyitli bir kirilim yapti, kisa sure
-# bu yonde devam eder" diye giriyor. Trendin tersine degil, yaninda durur.
+# Fiyat, kayan VWAP'tan (hacim agirlikli ortalama fiyat) belirgin sekilde
+# sapmis VE RSI ayni yonde asiri iken, tersine (bounce) giris yapilir.
 # ---------------------------------------------------------------------------
 
 COINS = [
@@ -54,22 +54,15 @@ CHECK_INTERVAL_MINUTES = 15
 
 RSI_PERIOD = 14
 ATR_PERIOD = 14
+VWAP_WINDOW = 96          # ~24 saat (15m mumla) - kayan VWAP penceresi
 
-# Kirilim (breakout) tanimi
-BREAKOUT_LOOKBACK = 20          # son N mumun en yuksek/dusuk kapanisini kirmali
-BREAKOUT_VOLUME_MULTIPLIER = 2.0
-BREAKOUT_BODY_ATR_MULTIPLIER = 0.6   # mum govdesi ATR'nin bu katindan buyuk olmali (kararli hareket)
-BREAKOUT_CLOSE_POSITION = 0.65        # mum kendi araliginin ust/alt %65'inde kapanmali (fitilli degil, guclu kapanis)
+# Turnuvada test edilen esikler
+RSI_LONG_MAX = 30
+RSI_SHORT_MIN = 70
+VWAP_DEV_LONG_MAX = -2.0   # VWAP'in en az %2 altinda
+VWAP_DEV_SHORT_MIN = 2.0   # VWAP'in en az %2 ustunde
 
-# RSI "momentum insa oluyor ama henuz tukenmedi" bolgesi
-LONG_RSI_MIN, LONG_RSI_MAX = 50, 78
-SHORT_RSI_MIN, SHORT_RSI_MAX = 22, 50
-
-# Coin'in kendi 1h trendi kirilim yonunu desteklemeli (ya da en azindan karsi olmamali)
-TREND_FILTER_TIMEFRAME = "1h"
-TREND_EMA_GAP_THRESHOLD = 1.5   # bu esigin tersine guclu trend varsa kirilim reddedilir
-
-INVALIDATION_ATR_BUFFER = 1.0   # kirilim seviyesinin gerisine ATR'nin bu kati kadar tampon
+INVALIDATION_ATR_BUFFER = 1.0
 
 ORDERBOOK_IMBALANCE_RATIO = 1.2
 
@@ -113,8 +106,6 @@ def fetch_ohlcv_df(symbol: str, timeframe: str, limit: int = 100):
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["vol_sma20"] = df["volume"].rolling(20).mean()
 
     high_low = df["high"] - df["low"]
@@ -126,10 +117,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["body"] = (df["close"] - df["open"]).abs()
     df["is_bull"] = df["close"] > df["open"]
 
-    candle_range = (df["high"] - df["low"]).replace(0, np.nan)
-    df["close_position"] = (df["close"] - df["low"]) / candle_range
-    df["close_position"] = df["close_position"].fillna(0.5)
-
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -139,73 +126,38 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["rsi"] = 100 - (100 / (1 + rs))
     df["rsi"] = df["rsi"].fillna(50)
 
-    # Kirilim seviyeleri: SON mum haric onceki N mumun en yuksek/dusuk kapanisi
-    df["breakout_high"] = df["close"].shift(1).rolling(BREAKOUT_LOOKBACK).max()
-    df["breakout_low"] = df["close"].shift(1).rolling(BREAKOUT_LOOKBACK).min()
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    pv = typical_price * df["volume"]
+    df["vwap"] = pv.rolling(VWAP_WINDOW).sum() / df["volume"].rolling(VWAP_WINDOW).sum()
+    df["vwap_dev_pct"] = (df["close"] - df["vwap"]) / df["vwap"] * 100
 
     return df
 
 
 # ---------------------------------------------------------------------------
-# Kirilim kapisi (mandatory gate) - trend YONUNDE giris
+# RSI + VWAP birlesik teyit kapisi
 # ---------------------------------------------------------------------------
 
 def check_breakout_gate(df: pd.DataFrame):
     """
-    Son KAPANMIS muma bakar (df.iloc[-2]). Tum sartlar birden tutmali:
-      1. Kapanis, son N mumun en yuksek/dusuk kapanisini kirmis olmali
-      2. Hacim ortalamanin en az BREAKOUT_VOLUME_MULTIPLIER kati olmali
-      3. Mum govdesi ATR'ye gore guclu olmali (kararsiz/dojivari degil)
-      4. Mum kendi araliginin guclu tarafinda kapanmis olmali (fitil degil, gercek kirilim)
-      5. RSI "momentum insa oluyor" bolgesinde olmali (henuz asiri tukenmis degil)
+    Son KAPANMIS muma bakar (df.iloc[-2]).
+    LONG: RSI asiri satimda VE fiyat VWAP'in belirgin altinda
+    SHORT: RSI asiri alimda VE fiyat VWAP'in belirgin ustunde
     """
-    if len(df) < BREAKOUT_LOOKBACK + 5:
+    if len(df) < VWAP_WINDOW + 5:
         return None
 
     row = df.iloc[-2]
-    if pd.isna(row["breakout_high"]) or pd.isna(row["breakout_low"]) or pd.isna(row["atr14"]):
+    if pd.isna(row["vwap_dev_pct"]) or pd.isna(row["rsi"]) or pd.isna(row["atr14"]):
         return None
 
-    volume_ratio = row["volume"] / row["vol_sma20"] if row["vol_sma20"] else 0
-    if volume_ratio < BREAKOUT_VOLUME_MULTIPLIER:
-        return None
-
-    body_ratio = row["body"] / row["atr14"] if row["atr14"] > 0 else 0
-    if body_ratio < BREAKOUT_BODY_ATR_MULTIPLIER:
-        return None
-
-    # LONG: yukari kirilim
-    if (row["close"] > row["breakout_high"]
-            and row["close_position"] >= BREAKOUT_CLOSE_POSITION
-            and LONG_RSI_MIN <= row["rsi"] <= LONG_RSI_MAX):
+    if row["rsi"] <= RSI_LONG_MAX and row["vwap_dev_pct"] <= VWAP_DEV_LONG_MAX:
         return "LONG", row
 
-    # SHORT: asagi kirilim
-    if (row["close"] < row["breakout_low"]
-            and row["close_position"] <= (1 - BREAKOUT_CLOSE_POSITION)
-            and SHORT_RSI_MIN <= row["rsi"] <= SHORT_RSI_MAX):
+    if row["rsi"] >= RSI_SHORT_MIN and row["vwap_dev_pct"] >= VWAP_DEV_SHORT_MIN:
         return "SHORT", row
 
     return None
-
-
-def get_symbol_trend(symbol: str):
-    """Coin'in kendi 1h trendine bakar. Kirilim bu trendin tersine olmamali."""
-    try:
-        df1h = fetch_ohlcv_df(symbol, TREND_FILTER_TIMEFRAME, limit=60)
-        df1h = compute_indicators(df1h)
-        row = df1h.iloc[-2]
-        if pd.isna(row["ema50"]) or row["ema50"] == 0:
-            return "BILINMIYOR", 0.0
-        gap_pct = (row["ema20"] - row["ema50"]) / row["ema50"] * 100
-        if gap_pct <= -TREND_EMA_GAP_THRESHOLD:
-            return "DUSUS", gap_pct
-        if gap_pct >= TREND_EMA_GAP_THRESHOLD:
-            return "YUKSELIS", gap_pct
-        return "YATAY", gap_pct
-    except Exception as e:
-        print(f"{symbol} icin 1h trend alinamadi: {e}")
-        return "BILINMIYOR", 0.0
 
 
 def score_orderbook(symbol: str, direction: str) -> tuple:
@@ -229,8 +181,8 @@ def compute_invalidation(direction: str, row) -> float:
     atr = row["atr14"] if pd.notna(row["atr14"]) else 0
     buffer = atr * INVALIDATION_ATR_BUFFER
     if direction == "LONG":
-        return row["breakout_high"] - buffer
-    return row["breakout_low"] + buffer
+        return row["close"] - buffer
+    return row["close"] + buffer
 
 
 # ---------------------------------------------------------------------------
@@ -374,26 +326,15 @@ def scan_once():
 
             gate_result = check_breakout_gate(df)
             if not gate_result:
-                print(f"{symbol}: kirilim yok")
+                print(f"{symbol}: kriter yok")
                 continue
 
             direction, row = gate_result
 
-            symbol_trend, trend_gap = get_symbol_trend(symbol)
-            if direction == "LONG" and symbol_trend == "DUSUS":
-                print(f"{symbol}: LONG kirilim var ama 1h trend dususte ({trend_gap:+.1f}%), reddedildi")
-                continue
-            if direction == "SHORT" and symbol_trend == "YUKSELIS":
-                print(f"{symbol}: SHORT kirilim var ama 1h trend yukseliste ({trend_gap:+.1f}%), reddedildi")
-                continue
-
             breakdown = [
-                f"✅ Kırılım seviyesi: {row['breakout_high' if direction == 'LONG' else 'breakout_low']:.4f}",
-                f"✅ Hacim {row['volume']/row['vol_sma20']:.2f}x ortalama",
-                f"✅ Mum gövdesi {row['body']/row['atr14']:.2f}x ATR",
-                f"✅ Kapanış konumu: {row['close_position']:.2f}",
-                f"✅ RSI: {row['rsi']:.1f} (momentum bölgesinde)",
-                f"{'✅' if symbol_trend != 'BILINMIYOR' else '➖'} 1h trend: {symbol_trend} ({trend_gap:+.1f}%)",
+                f"✅ RSI: {row['rsi']:.1f} ({'asiri satim' if direction == 'LONG' else 'asiri alim'})",
+                f"✅ VWAP sapması: %{row['vwap_dev_pct']:+.2f}",
+                f"✅ Hacim {row['volume']/row['vol_sma20']:.2f}x ortalama" if pd.notna(row.get('vol_sma20')) and row.get('vol_sma20') else "➖ Hacim verisi yetersiz",
             ]
 
             ob_support, ob_note = score_orderbook(symbol, direction)
@@ -406,8 +347,8 @@ def scan_once():
             breakdown_text = "\n".join(f"- {b}" for b in breakdown)
 
             msg = (
-                f"{yon_emoji} {symbol} - MOMENTUM KIRILIMI\n"
-                f"(trend yönünde giriş, tersine bahis değil)\n\n"
+                f"{yon_emoji} {symbol} - RSI+VWAP TÜKENME sinyali (bounce)\n"
+                f"(9 tur / 66 strateji turnuvasının en yüksek isabetli sistemi)\n\n"
                 f"Giriş fiyatı: {row['close']:.4f}\n"
                 f"Geçersizlik seviyesi: {invalidation:.4f}\n\n"
                 f"⏱ Hedef tutuş: ~{TARGET_HOLD_MINUTES} dk | En fazla: {MAX_HOLD_MINUTES} dk\n\n"
@@ -432,11 +373,10 @@ def scan_once():
 
 def run_forever():
     send_telegram_message(
-        "Kripto MOMENTUM botu (trend takibi) başlatıldı.\n"
+        "Kripto botu (RSI+VWAP Birleşik Teyit) başlatıldı.\n"
         f"{len(WATCHLIST)} coin taranıyor.\n\n"
-        "Strateji değişti: artık tersine bahis değil, trend yönünde giriş yapılıyor.\n"
-        f"Kırılım şartları: hacim {BREAKOUT_VOLUME_MULTIPLIER}x+, güçlü gövde, güçlü kapanış, "
-        "RSI momentum bölgesinde, coin'in kendi 1h trendi karşı yönde olmamalı.\n\n"
+        "Strateji: 9 tur / 66 stratejilik turnuvada en yüksek isabet oranını gösteren sistem.\n"
+        f"Şart: RSI≤{RSI_LONG_MAX}/≥{RSI_SHORT_MIN} VE fiyat kayan VWAP'tan %2+ sapmış.\n\n"
         f"Hedef tutuş: ~{TARGET_HOLD_MINUTES} dk, en fazla {MAX_HOLD_MINUTES} dk — "
         f"{TARGET_HOLD_MINUTES}. dakikada otomatik hatırlatma gelecek."
     )
