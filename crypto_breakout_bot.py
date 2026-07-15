@@ -66,11 +66,15 @@ INVALIDATION_ATR_BUFFER = 1.0
 
 ORDERBOOK_IMBALANCE_RATIO = 1.2
 
-TARGET_HOLD_MINUTES = 20
-MAX_HOLD_MINUTES = 45
-
-CHECK_MINUTES = [15, 30, 45]
-SUCCESS_THRESHOLD_PCT = 0.15
+# 10. tur (uzun tutus) sonuclarina gore checkpoint bazli cikis:
+# (checkpoint_dakika, hedef_yuzde, etiket)
+CHECKPOINTS = [
+    (60, 0.3, "1sa"),
+    (240, 0.6, "4sa"),
+    (720, 1.0, "12sa"),
+    (1440, 1.5, "24sa"),
+]
+MAX_HOLD_MINUTES = CHECKPOINTS[-1][0]
 
 exchange = ccxt.okx({
     "options": {"defaultType": "swap"},
@@ -78,7 +82,6 @@ exchange = ccxt.okx({
 })
 
 _unsupported_symbols = set()
-_reminders = {}
 
 
 # ---------------------------------------------------------------------------
@@ -205,16 +208,21 @@ def log_signal(symbol: str, direction: str, row, breakdown: list):
         ])
 
 
+PENDING_FIELDNAMES = ["symbol", "direction", "entry_price", "entry_time", "invalidation"] + [
+    f"checked_{label}" for _, _, label in CHECKPOINTS
+] + ["closed"]
+
+
 def log_pending(symbol: str, direction: str, entry_price: float, entry_time: datetime, invalidation: float):
     file_exists = os.path.isfile(PENDING_FILE)
     with open(PENDING_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow([
-                "symbol", "direction", "entry_price", "entry_time", "invalidation",
-                "checked_15m", "checked_30m", "checked_45m"
-            ])
-        writer.writerow([symbol, direction, entry_price, entry_time.isoformat(), invalidation, "0", "0", "0"])
+            writer.writerow(PENDING_FIELDNAMES)
+        row = [symbol, direction, entry_price, entry_time.isoformat(), invalidation]
+        row += ["0" for _ in CHECKPOINTS]
+        row += ["0"]
+        writer.writerow(row)
 
 
 def _read_pending():
@@ -225,87 +233,94 @@ def _read_pending():
 
 
 def _write_pending(rows):
-    fieldnames = ["symbol", "direction", "entry_price", "entry_time", "invalidation",
-                  "checked_15m", "checked_30m", "checked_45m"]
     with open(PENDING_FILE, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=PENDING_FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
 
 
-def log_outcome(symbol, direction, entry_price, entry_time, minutes, current_price, pct_change, success):
+def log_outcome(symbol, direction, entry_price, entry_time, minutes, label, target_pct,
+                 current_price, pct_change, success):
     file_exists = os.path.isfile(OUTCOME_FILE)
     with open(OUTCOME_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow([
-                "symbol", "direction", "entry_price", "entry_time", "minutes_after",
-                "price_now", "pct_change", "success"
+                "symbol", "direction", "entry_price", "entry_time", "minutes_after", "checkpoint",
+                "target_pct", "price_now", "pct_change", "success"
             ])
         writer.writerow([
-            symbol, direction, entry_price, entry_time, minutes, current_price, f"{pct_change:.3f}", success
+            symbol, direction, entry_price, entry_time, minutes, label,
+            target_pct, current_price, f"{pct_change:.3f}", success
         ])
 
 
 def check_pending_outcomes():
     rows = _read_pending()
     if not rows:
-        pass
-    else:
-        now = datetime.now()
-        still_pending = []
-        for r in rows:
-            entry_time = datetime.fromisoformat(r["entry_time"])
-            entry_price = float(r["entry_price"])
-            symbol = r["symbol"]
-            direction = r["direction"]
-            all_checked = True
-            for m in CHECK_MINUTES:
-                flag_key = f"checked_{m}m"
-                if r.get(flag_key, "0") == "1":
-                    continue
-                all_checked = False
-                if now >= entry_time + timedelta(minutes=m):
-                    try:
-                        ticker = exchange.fetch_ticker(symbol)
-                        current_price = ticker["last"]
-                        pct_change = (current_price - entry_price) / entry_price * 100
-                        if direction == "LONG":
-                            success = pct_change >= SUCCESS_THRESHOLD_PCT
-                        else:
-                            success = pct_change <= -SUCCESS_THRESHOLD_PCT
-                        log_outcome(symbol, direction, entry_price, r["entry_time"], m,
-                                    current_price, pct_change, success)
-                        r[flag_key] = "1"
-                    except Exception as e:
-                        print(f"{symbol} sonuc kontrolu hatasi: {e}")
-            if not all_checked:
-                still_pending.append(r)
-        _write_pending(still_pending)
+        return
 
     now = datetime.now()
-    still_reminding = {}
-    for symbol, info in _reminders.items():
-        if now >= info["remind_at"]:
+    still_pending = []
+
+    for r in rows:
+        if r.get("closed", "0") == "1":
+            continue
+
+        entry_time = datetime.fromisoformat(r["entry_time"])
+        entry_price = float(r["entry_price"])
+        symbol = r["symbol"]
+        direction = r["direction"]
+        closed = False
+
+        for minutes, target_pct, label in CHECKPOINTS:
+            flag_key = f"checked_{label}"
+            if r.get(flag_key, "0") == "1":
+                continue
+            if now < entry_time + timedelta(minutes=minutes):
+                # bu checkpoint'e daha ulasilmadi, sonraki checkpoint'ler de beklemede
+                break
+
             try:
                 ticker = exchange.fetch_ticker(symbol)
                 current_price = ticker["last"]
-                pct_change = (current_price - info["entry_price"]) / info["entry_price"] * 100
-                if info["direction"] == "SHORT":
-                    pct_change = -pct_change
-                msg = (
-                    f"⏰ {symbol} - hedef süre doldu (~{TARGET_HOLD_MINUTES} dk)\n"
-                    f"Giriş: {info['entry_price']:.4f} | Şimdi: {current_price:.4f}\n"
-                    f"Yöndeki değişim: {pct_change:+.2f}%\n\n"
-                    f"Pozisyonu gözden geçirme zamanı (en fazla {MAX_HOLD_MINUTES} dk kuralın)."
-                )
-                send_telegram_message(msg)
+                raw_pct_change = (current_price - entry_price) / entry_price * 100
+                pct_change = raw_pct_change if direction == "LONG" else -raw_pct_change
+                success = pct_change >= target_pct
+
+                log_outcome(symbol, direction, entry_price, r["entry_time"], minutes, label,
+                            target_pct, current_price, pct_change, success)
+                r[flag_key] = "1"
+
+                if success:
+                    msg = (
+                        f"🎯 {symbol} {direction} - {label} checkpoint'te hedef tutturuldu\n"
+                        f"Giriş: {entry_price:.4f} | Şimdi: {current_price:.4f}\n"
+                        f"Değişim: {pct_change:+.2f}% (hedef: %{target_pct})\n\n"
+                        f"Öneri: kârı realize etmeyi değerlendir."
+                    )
+                    send_telegram_message(msg)
+                    r["closed"] = "1"
+                    closed = True
+                    break
+                elif label == CHECKPOINTS[-1][2]:
+                    msg = (
+                        f"⏱ {symbol} {direction} - 24sa sonunda hiçbir checkpoint'te hedef tutmadı\n"
+                        f"Giriş: {entry_price:.4f} | Şimdi: {current_price:.4f}\n"
+                        f"Son değişim: {pct_change:+.2f}%\n\n"
+                        f"Sinyal geçersiz sayılıyor, kapatılıyor."
+                    )
+                    send_telegram_message(msg)
+                    r["closed"] = "1"
+                    closed = True
             except Exception as e:
-                print(f"{symbol} hatirlatma hatasi: {e}")
-        else:
-            still_reminding[symbol] = info
-    _reminders.clear()
-    _reminders.update(still_reminding)
+                print(f"{symbol} sonuc kontrolu hatasi: {e}")
+                break
+
+        if not closed:
+            still_pending.append(r)
+
+    _write_pending(still_pending)
 
 
 # ---------------------------------------------------------------------------
@@ -346,22 +361,19 @@ def scan_once():
             yon_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
             breakdown_text = "\n".join(f"- {b}" for b in breakdown)
 
+            checkpoint_text = " / ".join(f"{label}(%{target})" for _, target, label in CHECKPOINTS)
             msg = (
                 f"{yon_emoji} {symbol} - RSI+VWAP TÜKENME sinyali (bounce)\n"
-                f"(9 tur / 66 strateji turnuvasının en yüksek isabetli sistemi)\n\n"
+                f"(10. tur / uzun tutuş sonuçlarına göre checkpoint bazlı çıkış)\n\n"
                 f"Giriş fiyatı: {row['close']:.4f}\n"
                 f"Geçersizlik seviyesi: {invalidation:.4f}\n\n"
-                f"⏱ Hedef tutuş: ~{TARGET_HOLD_MINUTES} dk | En fazla: {MAX_HOLD_MINUTES} dk\n\n"
+                f"⏱ Checkpoint hedefleri: {checkpoint_text}\n"
+                f"İlk tutan hedefte pozisyon kapanmış sayılır, en geç 24sa'da değerlendirme gelir.\n\n"
                 f"Teyit detayları:\n{breakdown_text}"
             )
             print(msg)
             send_telegram_message(msg)
             log_pending(symbol, direction, row["close"], datetime.now(), invalidation)
-            _reminders[symbol] = {
-                "entry_price": row["close"],
-                "direction": direction,
-                "remind_at": datetime.now() + timedelta(minutes=TARGET_HOLD_MINUTES),
-            }
 
         except Exception as e:
             if "does not have" in str(e).lower():
@@ -372,13 +384,14 @@ def scan_once():
 
 
 def run_forever():
+    checkpoint_text = " / ".join(f"{label}(%{target})" for _, target, label in CHECKPOINTS)
     send_telegram_message(
         "Kripto botu (RSI+VWAP Birleşik Teyit) başlatıldı.\n"
         f"{len(WATCHLIST)} coin taranıyor.\n\n"
-        "Strateji: 9 tur / 66 stratejilik turnuvada en yüksek isabet oranını gösteren sistem.\n"
+        "Strateji: 10. tur (uzun tutuş) sonuçlarına göre checkpoint bazlı çıkış.\n"
         f"Şart: RSI≤{RSI_LONG_MAX}/≥{RSI_SHORT_MIN} VE fiyat kayan VWAP'tan %2+ sapmış.\n\n"
-        f"Hedef tutuş: ~{TARGET_HOLD_MINUTES} dk, en fazla {MAX_HOLD_MINUTES} dk — "
-        f"{TARGET_HOLD_MINUTES}. dakikada otomatik hatırlatma gelecek."
+        f"Checkpoint hedefleri: {checkpoint_text}\n"
+        f"En fazla {MAX_HOLD_MINUTES // 60}sa tutuş, her checkpoint'te otomatik durum bildirimi gelecek."
     )
     while True:
         scan_once()
