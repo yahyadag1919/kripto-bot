@@ -335,6 +335,10 @@ def scan_once():
 
     check_pending_outcomes()
 
+    closest_long = None   # (vwap_dev_pct, symbol) - en negatif (LONG esigine en yakin)
+    closest_short = None  # (vwap_dev_pct, symbol) - en pozitif (SHORT esigine en yakin)
+    scanned = 0
+
     for symbol in WATCHLIST:
         if symbol in _unsupported_symbols:
             continue
@@ -343,6 +347,16 @@ def scan_once():
             df = compute_indicators(df)
 
             gate_result = check_breakout_gate(df)
+
+            row = df.iloc[-2]
+            if pd.notna(row.get("vwap_dev_pct")):
+                dev = row["vwap_dev_pct"]
+                scanned += 1
+                if closest_long is None or dev < closest_long[0]:
+                    closest_long = (dev, symbol)
+                if closest_short is None or dev > closest_short[0]:
+                    closest_short = (dev, symbol)
+
             if not gate_result:
                 print(f"{symbol}: kriter yok")
                 continue
@@ -384,6 +398,13 @@ def scan_once():
                 print(f"{symbol}: bu borsada islem gormuyor, listeden cikarildi")
             else:
                 print(f"{symbol} hata: {e}")
+
+    if closest_long and closest_short:
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] Tarama bitti - {scanned} coin. "
+            f"Esige en yakin -> LONG: {closest_long[1]} (%{closest_long[0]:+.2f}, esik: %{VWAP_DEV_LONG_MAX}) | "
+            f"SHORT: {closest_short[1]} (%{closest_short[0]:+.2f}, esik: %{VWAP_DEV_SHORT_MIN})"
+        )
 
 
 def run_forever():
