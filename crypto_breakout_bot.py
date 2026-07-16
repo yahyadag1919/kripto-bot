@@ -65,6 +65,9 @@ RSI_SHORT_MIN = 70
 VWAP_DEV_LONG_MAX = -2.0   # VWAP'in en az %2 altinda
 VWAP_DEV_SHORT_MIN = 2.0   # VWAP'in en az %2 ustunde
 
+# Ikinci sinyal kolu: Hacim Z-Skor (10. turda 570 sinyal, %72.8 isabet, +%0.371 ort. net)
+VOLUME_ZSCORE_THRESHOLD = 2.0
+
 INVALIDATION_ATR_BUFFER = 1.0
 
 ORDERBOOK_IMBALANCE_RATIO = 1.2
@@ -137,6 +140,9 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["vwap"] = pv.rolling(VWAP_WINDOW).sum() / df["volume"].rolling(VWAP_WINDOW).sum()
     df["vwap_dev_pct"] = (df["close"] - df["vwap"]) / df["vwap"] * 100
 
+    df["vol_std20"] = df["volume"].rolling(20).std()
+    df["vol_zscore"] = (df["volume"] - df["vol_sma20"]) / df["vol_std20"].replace(0, np.nan)
+
     return df
 
 
@@ -161,6 +167,32 @@ def check_breakout_gate(df: pd.DataFrame):
         return "LONG", row
 
     if row["vwap_dev_pct"] >= VWAP_DEV_SHORT_MIN:
+        return "SHORT", row
+
+    return None
+
+
+def check_volume_zscore_gate(df: pd.DataFrame):
+    """
+    Son KAPANMIS muma bakar (df.iloc[-2]).
+    Hacim, son 20 mumun ortalamasindan z-skor bazinda asiri sapmissa (klimaks hacim),
+    mumun yonune ters bounce sinyali uretir:
+    LONG: klimaks hacimli dusus mumu (satis tukenmesi)
+    SHORT: klimaks hacimli yukselis mumu (alim tukenmesi)
+    """
+    if len(df) < 25:
+        return None
+
+    row = df.iloc[-2]
+    if pd.isna(row.get("vol_zscore")) or pd.isna(row["atr14"]):
+        return None
+
+    if row["vol_zscore"] < VOLUME_ZSCORE_THRESHOLD:
+        return None
+
+    if row["close"] < row["open"]:
+        return "LONG", row
+    elif row["close"] > row["open"]:
         return "SHORT", row
 
     return None
@@ -200,29 +232,29 @@ PENDING_FILE = "pending_signals.csv"
 OUTCOME_FILE = "signal_outcomes.csv"
 
 
-def log_signal(symbol: str, direction: str, row, breakdown: list):
+def log_signal(symbol: str, strategy: str, direction: str, row, breakdown: list):
     file_exists = os.path.isfile(SIGNAL_LOG_FILE)
     with open(SIGNAL_LOG_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(["timestamp", "symbol", "direction", "price", "rsi", "breakdown"])
+            writer.writerow(["timestamp", "symbol", "strategy", "direction", "price", "rsi", "breakdown"])
         writer.writerow([
-            datetime.now().isoformat(), symbol, direction, row["close"], row["rsi"], " | ".join(breakdown)
+            datetime.now().isoformat(), symbol, strategy, direction, row["close"], row["rsi"], " | ".join(breakdown)
         ])
 
 
-PENDING_FIELDNAMES = ["symbol", "direction", "entry_price", "entry_time", "invalidation"] + [
+PENDING_FIELDNAMES = ["symbol", "strategy", "direction", "entry_price", "entry_time", "invalidation"] + [
     f"checked_{label}" for _, _, label in CHECKPOINTS
 ] + ["closed"]
 
 
-def log_pending(symbol: str, direction: str, entry_price: float, entry_time: datetime, invalidation: float):
+def log_pending(symbol: str, strategy: str, direction: str, entry_price: float, entry_time: datetime, invalidation: float):
     file_exists = os.path.isfile(PENDING_FILE)
     with open(PENDING_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(PENDING_FIELDNAMES)
-        row = [symbol, direction, entry_price, entry_time.isoformat(), invalidation]
+        row = [symbol, strategy, direction, entry_price, entry_time.isoformat(), invalidation]
         row += ["0" for _ in CHECKPOINTS]
         row += ["0"]
         writer.writerow(row)
@@ -242,18 +274,18 @@ def _write_pending(rows):
         writer.writerows(rows)
 
 
-def log_outcome(symbol, direction, entry_price, entry_time, minutes, label, target_pct,
+def log_outcome(symbol, strategy, direction, entry_price, entry_time, minutes, label, target_pct,
                  current_price, pct_change, success):
     file_exists = os.path.isfile(OUTCOME_FILE)
     with open(OUTCOME_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow([
-                "symbol", "direction", "entry_price", "entry_time", "minutes_after", "checkpoint",
+                "symbol", "strategy", "direction", "entry_price", "entry_time", "minutes_after", "checkpoint",
                 "target_pct", "price_now", "pct_change", "success"
             ])
         writer.writerow([
-            symbol, direction, entry_price, entry_time, minutes, label,
+            symbol, strategy, direction, entry_price, entry_time, minutes, label,
             target_pct, current_price, f"{pct_change:.3f}", success
         ])
 
@@ -273,6 +305,7 @@ def check_pending_outcomes():
         entry_time = datetime.fromisoformat(r["entry_time"])
         entry_price = float(r["entry_price"])
         symbol = r["symbol"]
+        strategy = r.get("strategy", "?")
         direction = r["direction"]
         closed = False
 
@@ -291,13 +324,13 @@ def check_pending_outcomes():
                 pct_change = raw_pct_change if direction == "LONG" else -raw_pct_change
                 success = pct_change >= target_pct
 
-                log_outcome(symbol, direction, entry_price, r["entry_time"], minutes, label,
+                log_outcome(symbol, strategy, direction, entry_price, r["entry_time"], minutes, label,
                             target_pct, current_price, pct_change, success)
                 r[flag_key] = "1"
 
                 if success:
                     msg = (
-                        f"🎯 {symbol} {direction} - {label} checkpoint'te hedef tutturuldu\n"
+                        f"🎯 [{strategy}] {symbol} {direction} - {label} checkpoint'te hedef tutturuldu\n"
                         f"Giriş: {entry_price:.4f} | Şimdi: {current_price:.4f}\n"
                         f"Değişim: {pct_change:+.2f}% (hedef: %{target_pct})\n\n"
                         f"Öneri: kârı realize etmeyi değerlendir."
@@ -308,7 +341,7 @@ def check_pending_outcomes():
                     break
                 elif label == CHECKPOINTS[-1][2]:
                     msg = (
-                        f"⏱ {symbol} {direction} - 24sa sonunda hiçbir checkpoint'te hedef tutmadı\n"
+                        f"⏱ [{strategy}] {symbol} {direction} - 24sa sonunda hiçbir checkpoint'te hedef tutmadı\n"
                         f"Giriş: {entry_price:.4f} | Şimdi: {current_price:.4f}\n"
                         f"Son değişim: {pct_change:+.2f}%\n\n"
                         f"Sinyal geçersiz sayılıyor, kapatılıyor."
@@ -330,6 +363,28 @@ def check_pending_outcomes():
 # Ana tarama
 # ---------------------------------------------------------------------------
 
+def _emit_signal(symbol: str, strategy: str, strategy_desc: str, direction: str, row, breakdown: list):
+    log_signal(symbol, strategy, direction, row, breakdown)
+
+    invalidation = compute_invalidation(direction, row)
+    yon_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+    breakdown_text = "\n".join(f"- {b}" for b in breakdown)
+
+    checkpoint_text = " / ".join(f"{label}(%{target})" for _, target, label in CHECKPOINTS)
+    msg = (
+        f"{yon_emoji} {symbol} - {strategy} sinyali (bounce)\n"
+        f"({strategy_desc})\n\n"
+        f"Giriş fiyatı: {row['close']:.4f}\n"
+        f"Geçersizlik seviyesi: {invalidation:.4f}\n\n"
+        f"⏱ Checkpoint hedefleri: {checkpoint_text}\n"
+        f"İlk tutan hedefte pozisyon kapanmış sayılır, en geç 24sa'da değerlendirme gelir.\n\n"
+        f"Teyit detayları:\n{breakdown_text}"
+    )
+    print(msg)
+    send_telegram_message(msg)
+    log_pending(symbol, strategy, direction, row["close"], datetime.now(), invalidation)
+
+
 def scan_once():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Tarama basliyor...")
 
@@ -345,10 +400,8 @@ def scan_once():
         try:
             df = fetch_ohlcv_df(symbol, TIMEFRAME, limit=100)
             df = compute_indicators(df)
-
-            gate_result = check_breakout_gate(df)
-
             row = df.iloc[-2]
+
             if pd.notna(row.get("vwap_dev_pct")):
                 dev = row["vwap_dev_pct"]
                 scanned += 1
@@ -357,40 +410,44 @@ def scan_once():
                 if closest_short is None or dev > closest_short[0]:
                     closest_short = (dev, symbol)
 
-            if not gate_result:
+            fired = False
+
+            vwap_result = check_breakout_gate(df)
+            if vwap_result:
+                direction, vrow = vwap_result
+                breakdown = [
+                    f"✅ VWAP sapması: %{vrow['vwap_dev_pct']:+.2f} (giriş şartı)",
+                    f"ℹ️ RSI: {vrow['rsi']:.1f} (bilgi amaçlı, şart değil)",
+                    f"✅ Hacim {vrow['volume']/vrow['vol_sma20']:.2f}x ortalama" if pd.notna(vrow.get('vol_sma20')) and vrow.get('vol_sma20') else "➖ Hacim verisi yetersiz",
+                ]
+                ob_support, ob_note = score_orderbook(symbol, direction)
+                breakdown.append(f"{'✅' if ob_support else '➖'} Order book: {ob_note}")
+                _emit_signal(
+                    symbol, "VWAP Sapması",
+                    "10. tur / uzun tutuş turnuvasında en çok sinyal + en iyi ort. net getiriyi veren sistem",
+                    direction, vrow, breakdown,
+                )
+                fired = True
+
+            zscore_result = check_volume_zscore_gate(df)
+            if zscore_result:
+                direction, zrow = zscore_result
+                breakdown = [
+                    f"✅ Hacim Z-Skor: {zrow['vol_zscore']:.2f} (giriş şartı, eşik: {VOLUME_ZSCORE_THRESHOLD})",
+                    f"ℹ️ Mum yönü: {'düşüş (klimaks satış)' if direction == 'LONG' else 'yükseliş (klimaks alım)'}",
+                    f"ℹ️ RSI: {zrow['rsi']:.1f} (bilgi amaçlı, şart değil)",
+                ]
+                ob_support, ob_note = score_orderbook(symbol, direction)
+                breakdown.append(f"{'✅' if ob_support else '➖'} Order book: {ob_note}")
+                _emit_signal(
+                    symbol, "Hacim Z-Skor",
+                    "10. tur turnuvasında 570 sinyal, %72.8 isabet, +%0.371 ort. net getiren ikinci sistem",
+                    direction, zrow, breakdown,
+                )
+                fired = True
+
+            if not fired:
                 print(f"{symbol}: kriter yok")
-                continue
-
-            direction, row = gate_result
-
-            breakdown = [
-                f"✅ VWAP sapması: %{row['vwap_dev_pct']:+.2f} (giriş şartı)",
-                f"ℹ️ RSI: {row['rsi']:.1f} (bilgi amaçlı, şart değil)",
-                f"✅ Hacim {row['volume']/row['vol_sma20']:.2f}x ortalama" if pd.notna(row.get('vol_sma20')) and row.get('vol_sma20') else "➖ Hacim verisi yetersiz",
-            ]
-
-            ob_support, ob_note = score_orderbook(symbol, direction)
-            breakdown.append(f"{'✅' if ob_support else '➖'} Order book: {ob_note}")
-
-            log_signal(symbol, direction, row, breakdown)
-
-            invalidation = compute_invalidation(direction, row)
-            yon_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
-            breakdown_text = "\n".join(f"- {b}" for b in breakdown)
-
-            checkpoint_text = " / ".join(f"{label}(%{target})" for _, target, label in CHECKPOINTS)
-            msg = (
-                f"{yon_emoji} {symbol} - VWAP SAPMASI sinyali (bounce)\n"
-                f"(10. tur / uzun tutuş turnuvasında en çok sinyal + en iyi ort. net getiriyi veren sistem)\n\n"
-                f"Giriş fiyatı: {row['close']:.4f}\n"
-                f"Geçersizlik seviyesi: {invalidation:.4f}\n\n"
-                f"⏱ Checkpoint hedefleri: {checkpoint_text}\n"
-                f"İlk tutan hedefte pozisyon kapanmış sayılır, en geç 24sa'da değerlendirme gelir.\n\n"
-                f"Teyit detayları:\n{breakdown_text}"
-            )
-            print(msg)
-            send_telegram_message(msg)
-            log_pending(symbol, direction, row["close"], datetime.now(), invalidation)
 
         except Exception as e:
             if "does not have" in str(e).lower():
@@ -410,10 +467,11 @@ def scan_once():
 def run_forever():
     checkpoint_text = " / ".join(f"{label}(%{target})" for _, target, label in CHECKPOINTS)
     send_telegram_message(
-        "Kripto botu (VWAP Sapması) başlatıldı.\n"
+        "Kripto botu (VWAP Sapması + Hacim Z-Skor) başlatıldı.\n"
         f"{len(WATCHLIST)} coin taranıyor.\n\n"
-        "Strateji: 10. tur (uzun tutuş) sonuçlarına göre en çok sinyal üreten ve en iyi ort. net getiriyi veren sistem.\n"
-        f"Şart: fiyat kayan VWAP'tan %2+ sapmış (RSI artık şart değil, bilgi amaçlı).\n\n"
+        "İki bağımsız sinyal kolu çalışıyor:\n"
+        f"1) VWAP Sapması: fiyat kayan VWAP'tan %2+ sapmış\n"
+        f"2) Hacim Z-Skor: hacim, son 20 mumun ortalamasından z-skor≥{VOLUME_ZSCORE_THRESHOLD} sapmış (klimaks hacim)\n\n"
         f"Checkpoint hedefleri: {checkpoint_text}\n"
         f"En fazla {MAX_HOLD_MINUTES // 60}sa tutuş, her checkpoint'te otomatik durum bildirimi gelecek."
     )
