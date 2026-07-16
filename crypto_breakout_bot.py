@@ -18,11 +18,13 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     )
 
 # ---------------------------------------------------------------------------
-# STRATEJI: RSI + VWAP Birlesik Teyit (9 turluk, 66 stratejilik turnuvada
-# en yuksek isabet oranini gosteren sistem - %65.4 isabet, en dusuk ort. zarar)
+# STRATEJI: VWAP Sapmasi (10. tur / uzun tutus turnuvasinda RSI+VWAP'tan
+# daha fazla sinyal ve daha iyi ort. net getiri veren sistem: %76.4 isabet,
+# 4796 sinyal, +%0.193 ort. net, +%926.4 toplam)
 #
 # Fiyat, kayan VWAP'tan (hacim agirlikli ortalama fiyat) belirgin sekilde
-# sapmis VE RSI ayni yonde asiri iken, tersine (bounce) giris yapilir.
+# sapmisken tersine (bounce) giris yapilir. RSI artik giris sarti degil,
+# sadece bilgi/teyit amacli gosteriliyor.
 # ---------------------------------------------------------------------------
 
 COINS = [
@@ -56,9 +58,10 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 VWAP_WINDOW = 96          # ~24 saat (15m mumla) - kayan VWAP penceresi
 
-# Turnuvada test edilen esikler
+# RSI artik giris sarti degil, sadece breakdown mesajinda bilgi amacli
 RSI_LONG_MAX = 30
 RSI_SHORT_MIN = 70
+# Tek giris sarti: VWAP sapmasi (10. turda test edilen esik)
 VWAP_DEV_LONG_MAX = -2.0   # VWAP'in en az %2 altinda
 VWAP_DEV_SHORT_MIN = 2.0   # VWAP'in en az %2 ustunde
 
@@ -144,8 +147,8 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def check_breakout_gate(df: pd.DataFrame):
     """
     Son KAPANMIS muma bakar (df.iloc[-2]).
-    LONG: RSI asiri satimda VE fiyat VWAP'in belirgin altinda
-    SHORT: RSI asiri alimda VE fiyat VWAP'in belirgin ustunde
+    LONG: fiyat VWAP'in belirgin altinda (RSI artik sart degil, bilgi amacli)
+    SHORT: fiyat VWAP'in belirgin ustunde (RSI artik sart degil, bilgi amacli)
     """
     if len(df) < VWAP_WINDOW + 5:
         return None
@@ -154,10 +157,10 @@ def check_breakout_gate(df: pd.DataFrame):
     if pd.isna(row["vwap_dev_pct"]) or pd.isna(row["rsi"]) or pd.isna(row["atr14"]):
         return None
 
-    if row["rsi"] <= RSI_LONG_MAX and row["vwap_dev_pct"] <= VWAP_DEV_LONG_MAX:
+    if row["vwap_dev_pct"] <= VWAP_DEV_LONG_MAX:
         return "LONG", row
 
-    if row["rsi"] >= RSI_SHORT_MIN and row["vwap_dev_pct"] >= VWAP_DEV_SHORT_MIN:
+    if row["vwap_dev_pct"] >= VWAP_DEV_SHORT_MIN:
         return "SHORT", row
 
     return None
@@ -347,8 +350,8 @@ def scan_once():
             direction, row = gate_result
 
             breakdown = [
-                f"✅ RSI: {row['rsi']:.1f} ({'asiri satim' if direction == 'LONG' else 'asiri alim'})",
-                f"✅ VWAP sapması: %{row['vwap_dev_pct']:+.2f}",
+                f"✅ VWAP sapması: %{row['vwap_dev_pct']:+.2f} (giriş şartı)",
+                f"ℹ️ RSI: {row['rsi']:.1f} (bilgi amaçlı, şart değil)",
                 f"✅ Hacim {row['volume']/row['vol_sma20']:.2f}x ortalama" if pd.notna(row.get('vol_sma20')) and row.get('vol_sma20') else "➖ Hacim verisi yetersiz",
             ]
 
@@ -363,8 +366,8 @@ def scan_once():
 
             checkpoint_text = " / ".join(f"{label}(%{target})" for _, target, label in CHECKPOINTS)
             msg = (
-                f"{yon_emoji} {symbol} - RSI+VWAP TÜKENME sinyali (bounce)\n"
-                f"(10. tur / uzun tutuş sonuçlarına göre checkpoint bazlı çıkış)\n\n"
+                f"{yon_emoji} {symbol} - VWAP SAPMASI sinyali (bounce)\n"
+                f"(10. tur / uzun tutuş turnuvasında en çok sinyal + en iyi ort. net getiriyi veren sistem)\n\n"
                 f"Giriş fiyatı: {row['close']:.4f}\n"
                 f"Geçersizlik seviyesi: {invalidation:.4f}\n\n"
                 f"⏱ Checkpoint hedefleri: {checkpoint_text}\n"
@@ -386,10 +389,10 @@ def scan_once():
 def run_forever():
     checkpoint_text = " / ".join(f"{label}(%{target})" for _, target, label in CHECKPOINTS)
     send_telegram_message(
-        "Kripto botu (RSI+VWAP Birleşik Teyit) başlatıldı.\n"
+        "Kripto botu (VWAP Sapması) başlatıldı.\n"
         f"{len(WATCHLIST)} coin taranıyor.\n\n"
-        "Strateji: 10. tur (uzun tutuş) sonuçlarına göre checkpoint bazlı çıkış.\n"
-        f"Şart: RSI≤{RSI_LONG_MAX}/≥{RSI_SHORT_MIN} VE fiyat kayan VWAP'tan %2+ sapmış.\n\n"
+        "Strateji: 10. tur (uzun tutuş) sonuçlarına göre en çok sinyal üreten ve en iyi ort. net getiriyi veren sistem.\n"
+        f"Şart: fiyat kayan VWAP'tan %2+ sapmış (RSI artık şart değil, bilgi amaçlı).\n\n"
         f"Checkpoint hedefleri: {checkpoint_text}\n"
         f"En fazla {MAX_HOLD_MINUTES // 60}sa tutuş, her checkpoint'te otomatik durum bildirimi gelecek."
     )
