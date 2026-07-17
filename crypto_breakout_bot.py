@@ -82,10 +82,42 @@ CHECKPOINTS = [
 ]
 MAX_HOLD_MINUTES = CHECKPOINTS[-1][0]
 
-exchange = ccxt.okx({
-    "options": {"defaultType": "swap"},
+exchange = ccxt.binanceusdm({
+    "apiKey": os.environ.get("BINANCE_API_KEY"),
+    "secret": os.environ.get("BINANCE_API_SECRET"),
     "enableRateLimit": True,
 })
+
+# TESTNET=true iken sahte parayla Binance'in test ortaminda calisir - gercek
+# paraya gecmeden once BUNUNLA test et. Railway'de TESTNET degiskenini "false"
+# yapinca gercek hesaba baglanir.
+USE_TESTNET = os.environ.get("TESTNET", "true").lower() == "true"
+if USE_TESTNET:
+    exchange.set_sandbox_mode(True)
+
+# Otomatik islem ayarlari
+AUTO_TRADING_ENABLED = os.environ.get("AUTO_TRADING_ENABLED", "false").lower() == "true"
+FULL_AUTO_TRADING = os.environ.get("FULL_AUTO_TRADING", "false").lower() == "true"
+POSITION_PCT_OF_BALANCE = float(os.environ.get("POSITION_PCT_OF_BALANCE", "2"))  # bakiyenin yuzde kaci
+LEVERAGE = int(os.environ.get("LEVERAGE", "20"))
+CONFIRM_TIMEOUT_MINUTES = 15
+STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "3"))  # sabit maks. zarar yuzdesi (fiyat bazinda, kaldiracsiz)
+
+# GUVENLIK KILIDI: tam otomasyon + gercek hesap kombinasyonu, ayri bir onay
+# degiskeni olmadan ASLA calismaz - yanlislikla gercek parayla insansiz
+# otomasyona gecmeyi engellemek icin. Testnet'te bu kilit devreye girmez.
+if FULL_AUTO_TRADING and not USE_TESTNET:
+    if os.environ.get("CONFIRM_REAL_MONEY_FULL_AUTO", "false").lower() != "true":
+        print(
+            "UYARI: FULL_AUTO_TRADING=true ve TESTNET=false ama "
+            "CONFIRM_REAL_MONEY_FULL_AUTO=true ayarlanmamis. Guvenlik icin tam "
+            "otomasyon KAPATILDI, yari-otomatik (onay butonlu) moda dusuluyor."
+        )
+        FULL_AUTO_TRADING = False
+        AUTO_TRADING_ENABLED = True
+
+PENDING_CONFIRMATIONS = {}   # confirm_id -> {symbol, direction, entry_price, invalidation, created_at}
+_telegram_update_offset = 0
 
 _unsupported_symbols = set()
 
@@ -101,6 +133,135 @@ def send_telegram_message(text: str):
         requests.post(url, data=payload, timeout=10)
     except Exception as e:
         print(f"Telegram gonderim hatasi: {e}")
+
+
+def send_telegram_confirm(text: str, confirm_id: str):
+    """Sinyal mesajini 'Ac'/'Gec' butonlariyla gonderir - buton basilmadan hicbir islem yapilmaz."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "✅ Aç", "callback_data": f"confirm:{confirm_id}"},
+            {"text": "❌ Geç", "callback_data": f"reject:{confirm_id}"},
+        ]]
+    }
+    try:
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "reply_markup": keyboard}, timeout=10)
+    except Exception as e:
+        print(f"Telegram onay mesaji gonderim hatasi: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Yari-otomatik islem yurutme (Binance Futures)
+# ---------------------------------------------------------------------------
+
+def _set_leverage_safe(symbol: str):
+    try:
+        exchange.set_leverage(LEVERAGE, symbol)
+    except Exception as e:
+        print(f"Kaldirac ayarlama hatasi ({symbol}): {e}")
+
+
+def _compute_position_size(symbol: str, entry_price: float) -> float:
+    balance = exchange.fetch_balance()
+    free_usdt = balance.get("USDT", {}).get("free", 0)
+    position_value = free_usdt * (POSITION_PCT_OF_BALANCE / 100) * LEVERAGE
+    quantity = position_value / entry_price
+    return float(exchange.amount_to_precision(symbol, quantity))
+
+
+def _compute_final_stop_price(direction: str, entry_price: float, invalidation: float) -> float:
+    """
+    Iki aday stop seviyesinden (strateji bazli 'gecersizlik' ve sabit STOP_LOSS_PCT)
+    hangisi girisin daha yakininda ise (yani zarari daha kucuk tutuyorsa) onu secer.
+    Boylece STOP_LOSS_PCT her zaman bir "maksimum zarar tavani" gibi calisir.
+    """
+    pct_stop = entry_price * (1 - STOP_LOSS_PCT / 100) if direction == "LONG" else entry_price * (1 + STOP_LOSS_PCT / 100)
+    if direction == "LONG":
+        return max(invalidation, pct_stop)  # ikisi de giristen asagida - buyuk olan (giristen yakin) daha sikidir
+    else:
+        return min(invalidation, pct_stop)  # ikisi de giristen yukarida - kucuk olan (giristen yakin) daha sikidir
+
+
+def execute_order(symbol: str, direction: str, entry_price: float, invalidation: float):
+    """Piyasa emriyle pozisyon acar + (gecersizlik seviyesi ile sabit %STOP_LOSS_PCT'den hangisi
+    daha siki ise) koruyucu stop emri birakir - boylece maksimum zarar her zaman sinirli olur."""
+    _set_leverage_safe(symbol)
+    side = "buy" if direction == "LONG" else "sell"
+    qty = _compute_position_size(symbol, entry_price)
+    if qty <= 0:
+        raise ValueError("Hesaplanan pozisyon miktari sifir veya negatif - bakiyeni kontrol et.")
+
+    order = exchange.create_order(symbol, type="market", side=side, amount=qty)
+
+    stop_price = _compute_final_stop_price(direction, entry_price, invalidation)
+    stop_side = "sell" if direction == "LONG" else "buy"
+    try:
+        exchange.create_order(
+            symbol, type="STOP_MARKET", side=stop_side, amount=qty,
+            params={"stopPrice": stop_price, "reduceOnly": True},
+        )
+    except Exception as e:
+        send_telegram_message(f"⚠️ {symbol} pozisyonu acildi AMA koruyucu stop emri BASARISIZ oldu: {e}\nManuel stop koymayi unutma!")
+
+    return order, qty, stop_price
+
+
+def process_telegram_updates():
+    """Telegram'dan gelen buton tikla (callback_query) olaylarini isler."""
+    global _telegram_update_offset
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    try:
+        resp = requests.get(url, params={"offset": _telegram_update_offset, "timeout": 5}, timeout=10)
+        data = resp.json()
+    except Exception as e:
+        print(f"Telegram guncelleme cekme hatasi: {e}")
+        return
+
+    for update in data.get("result", []):
+        _telegram_update_offset = update["update_id"] + 1
+        cq = update.get("callback_query")
+        if not cq:
+            continue
+
+        data_str = cq.get("data", "")
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+                data={"callback_query_id": cq["id"]}, timeout=10,
+            )
+        except Exception:
+            pass
+
+        if ":" not in data_str:
+            continue
+        action, confirm_id = data_str.split(":", 1)
+        info = PENDING_CONFIRMATIONS.pop(confirm_id, None)
+        if not info:
+            send_telegram_message("Bu sinyalin suresi dolmus ya da zaten islendi.")
+            continue
+
+        if action == "confirm":
+            try:
+                order, qty, stop_price = execute_order(info["symbol"], info["direction"], info["entry_price"], info["invalidation"])
+                send_telegram_message(
+                    f"✅ {info['symbol']} {info['direction']} pozisyonu açıldı.\n"
+                    f"Miktar: {qty} | Giriş: ~{info['entry_price']:.4f} | Stop: {stop_price:.4f} (maks. %{STOP_LOSS_PCT} zarar)"
+                )
+            except Exception as e:
+                send_telegram_message(f"❌ {info['symbol']} emri gönderilirken hata oluştu: {e}")
+        elif action == "reject":
+            send_telegram_message(f"{info['symbol']} {info['direction']} sinyali geçildi.")
+
+
+def expire_old_confirmations():
+    now = datetime.now()
+    expired_ids = [
+        cid for cid, info in PENDING_CONFIRMATIONS.items()
+        if now - info["created_at"] > timedelta(minutes=CONFIRM_TIMEOUT_MINUTES)
+    ]
+    for cid in expired_ids:
+        info = PENDING_CONFIRMATIONS.pop(cid)
+        send_telegram_message(f"⏱ {info['symbol']} {info['direction']} sinyali {CONFIRM_TIMEOUT_MINUTES}dk içinde onaylanmadı, iptal edildi.")
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +528,7 @@ def _emit_signal(symbol: str, strategy: str, strategy_desc: str, direction: str,
     log_signal(symbol, strategy, direction, row, breakdown)
 
     invalidation = compute_invalidation(direction, row)
+    entry_price = row["close"]
     yon_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
     breakdown_text = "\n".join(f"- {b}" for b in breakdown)
 
@@ -374,15 +536,36 @@ def _emit_signal(symbol: str, strategy: str, strategy_desc: str, direction: str,
     msg = (
         f"{yon_emoji} {symbol} - {strategy} sinyali (bounce)\n"
         f"({strategy_desc})\n\n"
-        f"Giriş fiyatı: {row['close']:.4f}\n"
+        f"Giriş fiyatı: {entry_price:.4f}\n"
         f"Geçersizlik seviyesi: {invalidation:.4f}\n\n"
         f"⏱ Checkpoint hedefleri: {checkpoint_text}\n"
         f"İlk tutan hedefte pozisyon kapanmış sayılır, en geç 24sa'da değerlendirme gelir.\n\n"
         f"Teyit detayları:\n{breakdown_text}"
     )
     print(msg)
-    send_telegram_message(msg)
-    log_pending(symbol, strategy, direction, row["close"], datetime.now(), invalidation)
+
+    if FULL_AUTO_TRADING:
+        try:
+            order, qty, stop_price = execute_order(symbol, direction, entry_price, invalidation)
+            msg += (
+                f"\n\n🤖 TAM OTOMATİK: pozisyon açıldı.\n"
+                f"Miktar: {qty} | Stop: {stop_price:.4f} (maks. %{STOP_LOSS_PCT} zarar)"
+            )
+        except Exception as e:
+            msg += f"\n\n❌ TAM OTOMATİK emir başarısız oldu: {e}"
+        send_telegram_message(msg)
+    elif AUTO_TRADING_ENABLED:
+        confirm_id = f"{symbol.replace('/', '').replace(':', '')}-{int(time.time())}"
+        PENDING_CONFIRMATIONS[confirm_id] = {
+            "symbol": symbol, "direction": direction, "entry_price": entry_price,
+            "invalidation": invalidation, "created_at": datetime.now(),
+        }
+        msg += f"\n\n⚠️ {CONFIRM_TIMEOUT_MINUTES}dk içinde onaylamazsan otomatik iptal olur."
+        send_telegram_confirm(msg, confirm_id)
+    else:
+        send_telegram_message(msg)
+
+    log_pending(symbol, strategy, direction, entry_price, datetime.now(), invalidation)
 
 
 def scan_once():
@@ -466,6 +649,22 @@ def scan_once():
 
 def run_forever():
     checkpoint_text = " / ".join(f"{label}(%{target})" for _, target, label in CHECKPOINTS)
+    if FULL_AUTO_TRADING:
+        mode_text = (
+            f"🤖 TAM OTOMATİK MOD AÇIK — sinyaller ONAY BEKLEMEDEN Binance Futures'ta gerçek emir açar "
+            f"(bakiyenin %{POSITION_PCT_OF_BALANCE} | {LEVERAGE}x kaldıraç | maks. %{STOP_LOSS_PCT} zarar stop'u). "
+            f"{'⚠️ TESTNET (sahte para)' if USE_TESTNET else '🔴 GERÇEK HESAP - GERÇEK PARA'}"
+        )
+    elif AUTO_TRADING_ENABLED:
+        mode_text = (
+            f"⚡ YARI-OTOMATİK MOD AÇIK — sinyaller Telegram'dan onay bekleyecek, onaylarsan "
+            f"Binance Futures'ta gerçek emir açılır (bakiyenin %{POSITION_PCT_OF_BALANCE} | {LEVERAGE}x kaldıraç | "
+            f"maks. %{STOP_LOSS_PCT} zarar stop'u). "
+            f"{'⚠️ TESTNET (sahte para)' if USE_TESTNET else '🔴 GERÇEK HESAP - GERÇEK PARA'}"
+        )
+    else:
+        mode_text = "Sadece sinyal modu — otomatik işlem kapalı."
+
     send_telegram_message(
         "Kripto botu (VWAP Sapması + Hacim Z-Skor) başlatıldı.\n"
         f"{len(WATCHLIST)} coin taranıyor.\n\n"
@@ -473,11 +672,21 @@ def run_forever():
         f"1) VWAP Sapması: fiyat kayan VWAP'tan %2+ sapmış\n"
         f"2) Hacim Z-Skor: hacim, son 20 mumun ortalamasından z-skor≥{VOLUME_ZSCORE_THRESHOLD} sapmış (klimaks hacim)\n\n"
         f"Checkpoint hedefleri: {checkpoint_text}\n"
-        f"En fazla {MAX_HOLD_MINUTES // 60}sa tutuş, her checkpoint'te otomatik durum bildirimi gelecek."
+        f"En fazla {MAX_HOLD_MINUTES // 60}sa tutuş, her checkpoint'te otomatik durum bildirimi gelecek.\n\n"
+        f"{mode_text}"
     )
     while True:
         scan_once()
-        time.sleep(CHECK_INTERVAL_MINUTES * 60)
+        # bir sonraki taramaya kadar Telegram buton tikla olaylarini sik sik kontrol et
+        # (tam otomatik modda buton yok ama surec ayni kalsin diye dongu korunuyor)
+        elapsed = 0
+        poll_interval = 5
+        while elapsed < CHECK_INTERVAL_MINUTES * 60:
+            if AUTO_TRADING_ENABLED and not FULL_AUTO_TRADING:
+                process_telegram_updates()
+                expire_old_confirmations()
+            time.sleep(poll_interval)
+            elapsed += poll_interval
 
 
 if __name__ == "__main__":
