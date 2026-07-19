@@ -220,7 +220,10 @@ def _compute_final_stop_price(direction: str, entry_price: float, invalidation: 
 
 def execute_order(symbol: str, direction: str, entry_price: float, invalidation: float):
     """Piyasa emriyle pozisyon acar + (gecersizlik seviyesi ile sabit %STOP_LOSS_PCT'den hangisi
-    daha siki ise) koruyucu stop emri birakir - boylece maksimum zarar her zaman sinirli olur."""
+    daha siki ise) koruyucu stop emri birakir - boylece maksimum zarar her zaman sinirli olur.
+    Stop emri HERHANGI bir sebeple basarisiz olursa (orn. fiyat zaten stop seviyesini gecmisse,
+    '-2021 Order would immediately trigger' hatasi), pozisyonu KORUMASIZ birakmak yerine
+    aninda piyasa emriyle kapatir."""
     _set_leverage_safe(symbol)
     side = "buy" if direction == "LONG" else "sell"
     qty = _compute_position_size(symbol, entry_price)
@@ -237,7 +240,17 @@ def execute_order(symbol: str, direction: str, entry_price: float, invalidation:
             params={"stopPrice": stop_price, "reduceOnly": True},
         )
     except Exception as e:
-        send_telegram_message(f"⚠️ {symbol} pozisyonu acildi AMA koruyucu stop emri BASARISIZ oldu: {e}\nManuel stop koymayi unutma!")
+        close_err = _close_position(symbol, direction, qty)
+        if not close_err:
+            send_telegram_message(
+                f"⚠️ {symbol}: koruyucu stop emri başarısız oldu ({e}) — pozisyon KORUMASIZ kalmasın "
+                f"diye anında piyasa emriyle kapatıldı."
+            )
+        else:
+            send_telegram_message(
+                f"🚨 {symbol}: hem koruyucu stop ({e}) HEM acil kapama ({close_err}) başarısız oldu! "
+                f"Pozisyonu HEMEN manuel kontrol et!"
+            )
 
     return order, qty, stop_price
 
@@ -283,6 +296,15 @@ def process_telegram_updates():
                     f"✅ {info['symbol']} {info['direction']} pozisyonu açıldı.\n"
                     f"Miktar: {qty} | Giriş: ~{info['entry_price']:.4f} | Stop: {stop_price:.4f} (maks. %{STOP_LOSS_PCT} zarar)"
                 )
+                # bu sinyal icin daha once qty=0 ile yazilmis pending kaydini guncelle,
+                # boylece checkpoint sistemi bu gercek pozisyonu daha sonra kapatabilsin
+                pending_rows = _read_pending()
+                for pr in pending_rows:
+                    if (pr["symbol"] == info["symbol"] and pr["direction"] == info["direction"]
+                            and pr.get("closed", "0") == "0" and float(pr.get("qty", 0) or 0) == 0):
+                        pr["qty"] = qty
+                        break
+                _write_pending(pending_rows)
             except Exception as e:
                 send_telegram_message(f"❌ {info['symbol']} emri gönderilirken hata oluştu: {e}")
         elif action == "reject":
@@ -440,18 +462,19 @@ def log_signal(symbol: str, strategy: str, direction: str, row, breakdown: list)
         ])
 
 
-PENDING_FIELDNAMES = ["symbol", "strategy", "direction", "entry_price", "entry_time", "invalidation"] + [
+PENDING_FIELDNAMES = ["symbol", "strategy", "direction", "entry_price", "entry_time", "invalidation", "qty"] + [
     f"checked_{label}" for _, _, label in CHECKPOINTS
 ] + ["closed"]
 
 
-def log_pending(symbol: str, strategy: str, direction: str, entry_price: float, entry_time: datetime, invalidation: float):
+def log_pending(symbol: str, strategy: str, direction: str, entry_price: float, entry_time: datetime,
+                 invalidation: float, qty: float = 0):
     file_exists = os.path.isfile(PENDING_FILE)
     with open(PENDING_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(PENDING_FIELDNAMES)
-        row = [symbol, strategy, direction, entry_price, entry_time.isoformat(), invalidation]
+        row = [symbol, strategy, direction, entry_price, entry_time.isoformat(), invalidation, qty]
         row += ["0" for _ in CHECKPOINTS]
         row += ["0"]
         writer.writerow(row)
@@ -487,6 +510,21 @@ def log_outcome(symbol, strategy, direction, entry_price, entry_time, minutes, l
         ])
 
 
+def _close_position(symbol: str, direction: str, qty: float) -> str:
+    """
+    Pozisyonu piyasa emriyle kapatir (reduceOnly). Basarili olursa bos string,
+    basarisiz olursa hata metnini dondurur - boylece cagiran taraf mesaja ekleyebilir.
+    """
+    if qty <= 0:
+        return ""  # gercek pozisyon yok (sinyal-amacli veya onaysiz), kapatacak bir sey yok
+    close_side = "sell" if direction == "LONG" else "buy"
+    try:
+        exchange.create_order(symbol, type="market", side=close_side, amount=qty, params={"reduceOnly": True})
+        return ""
+    except Exception as e:
+        return str(e)
+
+
 def check_pending_outcomes():
     rows = _read_pending()
     if not rows:
@@ -504,6 +542,7 @@ def check_pending_outcomes():
         symbol = r["symbol"]
         strategy = r.get("strategy", "?")
         direction = r["direction"]
+        qty = float(r.get("qty", 0) or 0)
         closed = False
 
         for minutes, target_pct, label in CHECKPOINTS:
@@ -526,23 +565,30 @@ def check_pending_outcomes():
                 r[flag_key] = "1"
 
                 if success:
+                    close_err = _close_position(symbol, direction, qty)
                     msg = (
                         f"🎯 [{strategy}] {symbol} {direction} - {label} checkpoint'te hedef tutturuldu\n"
                         f"Giriş: {entry_price:.4f} | Şimdi: {current_price:.4f}\n"
                         f"Değişim: {pct_change:+.2f}% (hedef: %{target_pct})\n\n"
-                        f"Öneri: kârı realize etmeyi değerlendir."
+                        + (f"✅ Pozisyon otomatik kapatıldı."
+                           if qty > 0 and not close_err
+                           else (f"⚠️ Pozisyon kapatma emri başarısız: {close_err}\nManuel kapatmayi unutma!"
+                                 if close_err else "Öneri: kârı realize etmeyi değerlendir."))
                     )
                     send_telegram_message(msg)
                     r["closed"] = "1"
                     closed = True
                     break
                 elif label == CHECKPOINTS[-1][2]:
+                    close_err = _close_position(symbol, direction, qty)
                     msg = (
                         f"⏱ [{strategy}] {symbol} {direction} - 24sa sonunda hiçbir checkpoint'te hedef tutmadı\n"
                         f"Giriş: {entry_price:.4f} | Şimdi: {current_price:.4f}\n"
                         f"Son değişim: {pct_change:+.2f}%\n\n"
-                        f"Sinyal geçersiz sayılıyor, kapatılıyor."
-                    )
+                        + (f"Sinyal geçersiz sayıldı, pozisyon otomatik kapatıldı."
+                           if qty > 0 and not close_err
+                           else (f"⚠️ Pozisyon kapatma emri başarısız: {close_err}\nManuel kapatmayi unutma!"
+                                 if close_err else "Sinyal geçersiz sayılıyor.")))
                     send_telegram_message(msg)
                     r["closed"] = "1"
                     closed = True
@@ -580,12 +626,13 @@ def _emit_signal(symbol: str, strategy: str, strategy_desc: str, direction: str,
     )
     print(msg)
 
+    executed_qty = 0
     if FULL_AUTO_TRADING:
         try:
-            order, qty, stop_price = execute_order(symbol, direction, entry_price, invalidation)
+            order, executed_qty, stop_price = execute_order(symbol, direction, entry_price, invalidation)
             msg += (
                 f"\n\n🤖 TAM OTOMATİK: pozisyon açıldı.\n"
-                f"Miktar: {qty} | Stop: {stop_price:.4f} (maks. %{STOP_LOSS_PCT} zarar)"
+                f"Miktar: {executed_qty} | Stop: {stop_price:.4f} (maks. %{STOP_LOSS_PCT} zarar)"
             )
         except Exception as e:
             msg += f"\n\n❌ TAM OTOMATİK emir başarısız oldu: {e}"
@@ -601,7 +648,7 @@ def _emit_signal(symbol: str, strategy: str, strategy_desc: str, direction: str,
     else:
         send_telegram_message(msg)
 
-    log_pending(symbol, strategy, direction, entry_price, datetime.now(), invalidation)
+    log_pending(symbol, strategy, direction, entry_price, datetime.now(), invalidation, qty=executed_qty)
 
 
 def scan_once():
