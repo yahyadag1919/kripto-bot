@@ -512,17 +512,39 @@ def log_outcome(symbol, strategy, direction, entry_price, entry_time, minutes, l
 
 def _close_position(symbol: str, direction: str, qty: float) -> str:
     """
-    Pozisyonu piyasa emriyle kapatir (reduceOnly) VE o sembole ait kalan acik
-    emirleri (orn. artik sahipsiz kalan koruyucu stop emri) iptal eder - aksi
-    halde pozisyon kapansa bile stop emri borsada sahipsiz asili kalir ve
-    "Open Orders" listesi zamanla sismeye devam eder. Basarili olursa bos
-    string, basarisiz olursa hata metnini dondurur.
+    Pozisyonu kapatmadan once borsadan GERCEK pozisyon miktarini/yonunu sorar
+    (kendi kaydina korukoru guvenmek yerine) - boylece "ReduceOnly Order is
+    rejected" (-2022) hatasi (kayitli miktar borsadaki gercek miktarla
+    uyusmuyorsa olur) onlenir. Pozisyon zaten kapanmissa (miktar 0), bosuna
+    kapatma emri denemez, sadece kalan acik emirleri (orn. eski stop) temizler.
+    Basarili olursa bos string, basarisiz olursa hata metnini dondurur.
     """
-    if qty <= 0:
-        return ""  # gercek pozisyon yok (sinyal-amacli veya onaysiz), kapatacak bir sey yok
-    close_side = "sell" if direction == "LONG" else "buy"
+    live_qty = qty
+    live_direction = direction
     try:
-        exchange.create_order(symbol, type="market", side=close_side, amount=qty, params={"reduceOnly": True})
+        positions = exchange.fetch_positions([symbol])
+        found = 0
+        for p in positions:
+            contracts = abs(p.get("contracts") or 0)
+            if contracts > 0:
+                found = contracts
+                live_direction = "LONG" if p.get("side") == "long" else "SHORT"
+                break
+        live_qty = found
+    except Exception as e:
+        print(f"{symbol}: gercek pozisyon miktari sorgulanamadi, kayitli miktara guveniliyor: {e}")
+
+    if live_qty <= 0:
+        # pozisyon zaten kapanmis (baska bir yoldan) - kapatma emrine gerek yok
+        try:
+            exchange.cancel_all_orders(symbol)
+        except Exception:
+            pass
+        return ""
+
+    close_side = "sell" if live_direction == "LONG" else "buy"
+    try:
+        exchange.create_order(symbol, type="market", side=close_side, amount=live_qty, params={"reduceOnly": True})
     except Exception as e:
         return str(e)
 
