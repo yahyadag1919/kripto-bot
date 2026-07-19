@@ -512,17 +512,26 @@ def log_outcome(symbol, strategy, direction, entry_price, entry_time, minutes, l
 
 def _close_position(symbol: str, direction: str, qty: float) -> str:
     """
-    Pozisyonu piyasa emriyle kapatir (reduceOnly). Basarili olursa bos string,
-    basarisiz olursa hata metnini dondurur - boylece cagiran taraf mesaja ekleyebilir.
+    Pozisyonu piyasa emriyle kapatir (reduceOnly) VE o sembole ait kalan acik
+    emirleri (orn. artik sahipsiz kalan koruyucu stop emri) iptal eder - aksi
+    halde pozisyon kapansa bile stop emri borsada sahipsiz asili kalir ve
+    "Open Orders" listesi zamanla sismeye devam eder. Basarili olursa bos
+    string, basarisiz olursa hata metnini dondurur.
     """
     if qty <= 0:
         return ""  # gercek pozisyon yok (sinyal-amacli veya onaysiz), kapatacak bir sey yok
     close_side = "sell" if direction == "LONG" else "buy"
     try:
         exchange.create_order(symbol, type="market", side=close_side, amount=qty, params={"reduceOnly": True})
-        return ""
     except Exception as e:
         return str(e)
+
+    try:
+        exchange.cancel_all_orders(symbol)
+    except Exception as e:
+        print(f"{symbol}: kapanistan sonra kalan emirler iptal edilemedi: {e}")
+
+    return ""
 
 
 def check_pending_outcomes():
