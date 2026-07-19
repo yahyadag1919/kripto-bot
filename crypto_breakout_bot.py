@@ -93,7 +93,16 @@ exchange = ccxt.binanceusdm({
 # yapinca gercek hesaba baglanir.
 USE_TESTNET = os.environ.get("TESTNET", "true").lower() == "true"
 if USE_TESTNET:
-    exchange.set_sandbox_mode(True)
+    # NOT: ccxt, binanceusdm icin set_sandbox_mode()'u ARTIK DESTEKLEMIYOR (deprecated,
+    # bkz. https://t.me/ccxt_announcements/92) - o cagriyi kullanmiyoruz. Bunun yerine
+    # Binance'in yeni "Demo Trading" sistemine (demo.binance.com uzerinden olusturulan
+    # key'ler) ait adresi manuel olarak tanimliyoruz, bu ccxt'nin engelini atliyor.
+    try:
+        exchange.urls["api"]["fapiPublic"] = "https://demo-fapi.binance.com/fapi/v1"
+        exchange.urls["api"]["fapiPrivate"] = "https://demo-fapi.binance.com/fapi/v1"
+        exchange.urls["api"]["fapiPrivateV2"] = "https://demo-fapi.binance.com/fapi/v2"
+    except Exception as e:
+        print(f"Demo-fapi URL override uygulanamadi (ccxt surumu farkli olabilir): {e}")
 
 # Otomatik islem ayarlari
 AUTO_TRADING_ENABLED = os.environ.get("AUTO_TRADING_ENABLED", "false").lower() == "true"
