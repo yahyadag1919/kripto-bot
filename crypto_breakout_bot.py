@@ -92,17 +92,44 @@ exchange = ccxt.binanceusdm({
 # paraya gecmeden once BUNUNLA test et. Railway'de TESTNET degiskenini "false"
 # yapinca gercek hesaba baglanir.
 USE_TESTNET = os.environ.get("TESTNET", "true").lower() == "true"
+
+
+def _redirect_all_urls_to_demo(urls_node):
+    """
+    ccxt'nin urls['api'] yapisi, futures icin onlarca alt-uc-nokta (fapiPublic,
+    fapiPrivate, fapiPrivateV2, fapiPrivateV3, fapiData, vs.) icerir - bunlarin
+    hepsini tek tek elle yazmak yerine, iceride gecen 'fapi.binance.com' adresini
+    (nerede gecerse gecsin, ic ice sozluk/liste farketmeksizin) 'demo-fapi.binance.com'
+    ile degistiriyoruz. Boylece ccxt surumu/ic yapisi degisse bile calismaya devam eder.
+    """
+    if isinstance(urls_node, dict):
+        return {k: _redirect_all_urls_to_demo(v) for k, v in urls_node.items()}
+    if isinstance(urls_node, list):
+        return [_redirect_all_urls_to_demo(v) for v in urls_node]
+    if isinstance(urls_node, str):
+        return (urls_node
+                .replace("fapi.binance.com", "demo-fapi.binance.com")
+                .replace("testnet.binancefuture.com", "demo-fapi.binance.com"))
+    return urls_node
+
+
 if USE_TESTNET:
     # NOT: ccxt, binanceusdm icin set_sandbox_mode()'u ARTIK DESTEKLEMIYOR (deprecated,
     # bkz. https://t.me/ccxt_announcements/92) - o cagriyi kullanmiyoruz. Bunun yerine
     # Binance'in yeni "Demo Trading" sistemine (demo.binance.com uzerinden olusturulan
-    # key'ler) ait adresi manuel olarak tanimliyoruz, bu ccxt'nin engelini atliyor.
+    # key'ler) ait demo-fapi adresine TUM ic uc-noktalari (fapiPublic, fapiPrivate,
+    # fapiPrivateV2/V3, fapiData vs.) kapsayacak sekilde yonlendiriyoruz.
     try:
-        exchange.urls["api"]["fapiPublic"] = "https://demo-fapi.binance.com/fapi/v1"
-        exchange.urls["api"]["fapiPrivate"] = "https://demo-fapi.binance.com/fapi/v1"
-        exchange.urls["api"]["fapiPrivateV2"] = "https://demo-fapi.binance.com/fapi/v2"
+        exchange.urls["api"] = _redirect_all_urls_to_demo(exchange.urls["api"])
     except Exception as e:
         print(f"Demo-fapi URL override uygulanamadi (ccxt surumu farkli olabilir): {e}")
+    # ccxt, API key varsa piyasalari yuklerken ekstra bir "para birimi detaylari"
+    # cagrisi yapip gercek (canli) spot sunucusuna (api.binance.com/sapi/...) gidebiliyor -
+    # bu cagri futures islemleri icin gereksiz, demo key'le orada hata veriyordu. Kapatiyoruz.
+    try:
+        exchange.options["fetchCurrencies"] = False
+    except Exception:
+        pass
 
 # Otomatik islem ayarlari
 AUTO_TRADING_ENABLED = os.environ.get("AUTO_TRADING_ENABLED", "false").lower() == "true"
