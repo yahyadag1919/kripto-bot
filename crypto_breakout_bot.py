@@ -332,9 +332,11 @@ def process_telegram_updates():
                 order, qty, stop_price = execute_order(
                     info["symbol"], info["direction"], info["entry_price"], info["invalidation"], info.get("atr14")
                 )
+                actual_risk_usd = abs(info["entry_price"] - stop_price) * qty
                 send_telegram_message(
                     f"✅ {info['symbol']} {info['direction']} pozisyonu açıldı.\n"
-                    f"Miktar: {qty} | Giriş: ~{info['entry_price']:.4f} | Stop: {stop_price:.4f} (maks. %{STOP_LOSS_PCT} zarar)"
+                    f"Miktar: {qty} | Giriş: ~{info['entry_price']:.6f} | Stop: {stop_price:.6f}\n"
+                    f"Stop'a takılırsa risk edilen: ~{actual_risk_usd:.2f} USDT (bakiyenin ~%{RISK_PER_TRADE_PCT})"
                 )
                 # bu sinyal icin daha once qty=0 ile yazilmis pending kaydini guncelle,
                 # boylece checkpoint sistemi bu gercek pozisyonu daha sonra kapatabilsin
@@ -756,9 +758,11 @@ def _emit_signal(symbol: str, strategy: str, strategy_desc: str, direction: str,
     if FULL_AUTO_TRADING:
         try:
             order, executed_qty, stop_price = execute_order(symbol, direction, entry_price, invalidation, atr14)
+            actual_risk_usd = abs(entry_price - stop_price) * executed_qty
             msg += (
                 f"\n\n🤖 TAM OTOMATİK: pozisyon açıldı.\n"
-                f"Miktar: {executed_qty} | Stop: {stop_price:.4f} (maks. %{STOP_LOSS_PCT} zarar)"
+                f"Miktar: {executed_qty} | Stop: {stop_price:.6f}\n"
+                f"Stop'a takılırsa risk edilen: ~{actual_risk_usd:.2f} USDT (bakiyenin ~%{RISK_PER_TRADE_PCT})"
             )
         except Exception as e:
             msg += f"\n\n❌ TAM OTOMATİK emir başarısız oldu: {e}"
