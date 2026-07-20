@@ -486,9 +486,15 @@ def compute_invalidation(direction: str, row) -> float:
 # Loglama
 # ---------------------------------------------------------------------------
 
-SIGNAL_LOG_FILE = "signal_history.csv"
-PENDING_FILE = "pending_signals.csv"
-OUTCOME_FILE = "signal_outcomes.csv"
+# DATA_DIR bir Railway Volume'e (kalici disk) isaret ederse, bu CSV'ler her
+# deploy'da SIFIRLANMAZ - acik pozisyon takibi/checkpoint durumu korunur.
+# DATA_DIR ayarlanmazsa eskisi gibi calisir (gecici, deploy'da sifirlanir).
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+SIGNAL_LOG_FILE = os.path.join(DATA_DIR, "signal_history.csv")
+PENDING_FILE = os.path.join(DATA_DIR, "pending_signals.csv")
+OUTCOME_FILE = os.path.join(DATA_DIR, "signal_outcomes.csv")
 
 
 def log_signal(symbol: str, strategy: str, direction: str, row, breakdown: list):
@@ -885,6 +891,15 @@ def run_forever():
     else:
         mode_text = "Sadece sinyal modu — otomatik işlem kapalı."
 
+    recovered = [r for r in _read_pending() if r.get("closed", "0") != "1"]
+    persistence_note = (
+        f"💾 Kalıcı depolama AKTİF (DATA_DIR={DATA_DIR}) — yeniden başlatmada "
+        f"{len(recovered)} açık pozisyon takibi geri yüklendi."
+        if DATA_DIR != "."
+        else "⚠️ Kalıcı depolama KAPALI (DATA_DIR ayarlanmamış) — bu deploy'daki açık "
+             "pozisyon takibi bir sonraki deploy'da/restart'ta silinecek."
+    )
+
     send_telegram_message(
         "Kripto botu (VWAP Sapması + Hacim Z-Skor) başlatıldı.\n"
         f"{len(WATCHLIST)} coin taranıyor.\n\n"
@@ -893,7 +908,8 @@ def run_forever():
         f"2) Hacim Z-Skor: hacim, son 20 mumun ortalamasından z-skor≥{VOLUME_ZSCORE_THRESHOLD} sapmış (klimaks hacim)\n\n"
         f"Checkpoint hedefleri: {checkpoint_text}\n"
         f"En fazla {MAX_HOLD_MINUTES // 60}sa tutuş, her checkpoint'te otomatik durum bildirimi gelecek.\n\n"
-        f"{mode_text}"
+        f"{mode_text}\n\n"
+        f"{persistence_note}"
     )
     while True:
         scan_once()
