@@ -61,12 +61,23 @@ VWAP_WINDOW = 96          # ~24 saat (15m mumla) - kayan VWAP penceresi
 # RSI artik giris sarti degil, sadece breakdown mesajinda bilgi amacli
 RSI_LONG_MAX = 30
 RSI_SHORT_MIN = 70
-# Tek giris sarti: VWAP sapmasi (10. turda test edilen esik)
-VWAP_DEV_LONG_MAX = -2.0   # VWAP'in en az %2 altinda
-VWAP_DEV_SHORT_MIN = 2.0   # VWAP'in en az %2 ustunde
+# Eski sabit esik (artik kullanilmiyor, referans icin birakildi)
+VWAP_DEV_LONG_MAX = -2.0
+VWAP_DEV_SHORT_MIN = 2.0
+# Yeni: coin'in kendi ATR'sine gore dinamik VWAP sapma esigi (bkz. compute_indicators)
+DYNAMIC_ATR_MULT = 2.5
 
 # Ikinci sinyal kolu: Hacim Z-Skor (10. turda 570 sinyal, %72.8 isabet, +%0.371 ort. net)
 VOLUME_ZSCORE_THRESHOLD = 2.0
+
+# --- Trend + Funding filtresi (backtest ile dogrulandi) ---
+# Filtresiz VWAP: 2054 sinyal, %75.0 isabet, +%0.200 ort net
+# Trend+Funding filtreli VWAP: 354 sinyal, %79.9 isabet, +%0.470 ort net (2.3x)
+# Filtresiz Hacim Z-Skor CANLIDA ZARARLIYDI (-%0.071); Trend+Funding filtreli: +%0.223, %73.1 isabet
+TREND_FUNDING_FILTER_ENABLED = True
+TREND_TIMEFRAME = "4h"
+TREND_EMA_PERIOD = 200
+_trend_cache = {}  # symbol -> (ema200_deger, hesaplandigi_zaman) - her taramada yeniden cekmemek icin
 
 INVALIDATION_ATR_BUFFER = 1.0
 
@@ -404,6 +415,11 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["vol_std20"] = df["volume"].rolling(20).std()
     df["vol_zscore"] = (df["volume"] - df["vol_sma20"]) / df["vol_std20"].replace(0, np.nan)
 
+    # Gemini/test onerisi: sabit %2 yerine, coin'in kendi ATR'sine gore
+    # daralip genisleyen dinamik VWAP sapma esigi (12.5-20 gunluk backtest'te
+    # buyuk orneklemde - 988-1122 sinyal - tutarli pozitif cikti)
+    df["dynamic_vwap_threshold_pct"] = (df["atr14"] / df["close"]) * 100 * DYNAMIC_ATR_MULT
+
     return df
 
 
@@ -414,20 +430,26 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def check_breakout_gate(df: pd.DataFrame):
     """
     Son KAPANMIS muma bakar (df.iloc[-2]).
-    LONG: fiyat VWAP'in belirgin altinda (RSI artik sart degil, bilgi amacli)
-    SHORT: fiyat VWAP'in belirgin ustunde (RSI artik sart degil, bilgi amacli)
+    LONG: fiyat VWAP'in dinamik esigin altinda (RSI artik sart degil, bilgi amacli)
+    SHORT: fiyat VWAP'in dinamik esigin ustunde (RSI artik sart degil, bilgi amacli)
+    Esik artik sabit %2 degil, coin'in kendi ATR'sine gore daralip genisliyor
+    (test: buyuk orneklemde - 988-1122 sinyal - tutarli pozitif sonuc verdi).
     """
     if len(df) < VWAP_WINDOW + 5:
         return None
 
     row = df.iloc[-2]
-    if pd.isna(row["vwap_dev_pct"]) or pd.isna(row["rsi"]) or pd.isna(row["atr14"]):
+    if pd.isna(row["vwap_dev_pct"]) or pd.isna(row["rsi"]) or pd.isna(row["atr14"]) or pd.isna(row.get("dynamic_vwap_threshold_pct")):
         return None
 
-    if row["vwap_dev_pct"] <= VWAP_DEV_LONG_MAX:
+    threshold = row["dynamic_vwap_threshold_pct"]
+    if threshold <= 0:
+        return None
+
+    if row["vwap_dev_pct"] <= -threshold:
         return "LONG", row
 
-    if row["vwap_dev_pct"] >= VWAP_DEV_SHORT_MIN:
+    if row["vwap_dev_pct"] >= threshold:
         return "SHORT", row
 
     return None
@@ -474,6 +496,65 @@ def score_orderbook(symbol: str, direction: str) -> tuple:
         return False, f"bid/ask {ratio:.2f} (notr)"
     except Exception as e:
         return False, f"order book alinamadi ({e})"
+
+
+# ---------------------------------------------------------------------------
+# Trend + Funding filtresi (backtest ile dogrulandi - bkz. yukaridaki not)
+# 4sa/8sa'da bir degisen degerler oldugu icin saatte bir yenilenen basit bir
+# onbellek kullaniyoruz - 172 coin icin her taramada tekrar cekmek gereksiz
+# API yuku olustururdu.
+# ---------------------------------------------------------------------------
+
+_TREND_FUNDING_CACHE_MINUTES = 60
+
+
+def _cache_get_or_fetch(cache_dict, symbol, fetch_fn):
+    cached = cache_dict.get(symbol)
+    if cached and (datetime.now() - cached[1]).total_seconds() < _TREND_FUNDING_CACHE_MINUTES * 60:
+        return cached[0]
+    try:
+        value = fetch_fn()
+        cache_dict[symbol] = (value, datetime.now())
+        return value
+    except Exception as e:
+        print(f"{symbol}: trend/funding verisi cekilemedi: {e}")
+        return cached[0] if cached else None
+
+
+def get_trend_ema(symbol: str):
+    def _fetch():
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TREND_TIMEFRAME, limit=TREND_EMA_PERIOD + 20)
+        closes = pd.Series([c[4] for c in ohlcv])
+        return closes.ewm(span=TREND_EMA_PERIOD, adjust=False).mean().iloc[-1]
+    return _cache_get_or_fetch(_trend_cache, symbol, _fetch)
+
+
+_funding_cache = {}
+
+
+def get_funding_rate(symbol: str):
+    def _fetch():
+        fr = exchange.fetch_funding_rate(symbol)
+        return fr.get("fundingRate")
+    return _cache_get_or_fetch(_funding_cache, symbol, _fetch)
+
+
+def passes_trend_funding_filter(symbol: str, direction: str, current_price: float) -> tuple:
+    """Ikisi de gecmeli: 4sa 200 EMA trend yonu + funding rate isareti (backtest'te dogrulanan kombinasyon)."""
+    if not TREND_FUNDING_FILTER_ENABLED:
+        return True, "filtre kapali"
+
+    ema = get_trend_ema(symbol)
+    funding = get_funding_rate(symbol)
+    if ema is None or funding is None:
+        return False, "trend/funding verisi alinamadi, guvenli tarafta kalindi"
+
+    trend_ok = (current_price > ema) if direction == "LONG" else (current_price < ema)
+    funding_ok = (funding < 0) if direction == "LONG" else (funding > 0)
+
+    if trend_ok and funding_ok:
+        return True, f"trend+funding uyumlu (4sa EMA200={ema:.4f}, funding={funding:.5f})"
+    return False, f"trend/funding uyumsuz (4sa EMA200={ema:.4f}, funding={funding:.5f})"
 
 
 def compute_invalidation(direction: str, row) -> float:
@@ -828,36 +909,47 @@ def scan_once():
             vwap_result = check_breakout_gate(df)
             if vwap_result:
                 direction, vrow = vwap_result
-                breakdown = [
-                    f"✅ VWAP sapması: %{vrow['vwap_dev_pct']:+.2f} (giriş şartı)",
-                    f"ℹ️ RSI: {vrow['rsi']:.1f} (bilgi amaçlı, şart değil)",
-                    f"✅ Hacim {vrow['volume']/vrow['vol_sma20']:.2f}x ortalama" if pd.notna(vrow.get('vol_sma20')) and vrow.get('vol_sma20') else "➖ Hacim verisi yetersiz",
-                ]
-                ob_support, ob_note = score_orderbook(symbol, direction)
-                breakdown.append(f"{'✅' if ob_support else '➖'} Order book: {ob_note}")
-                _emit_signal(
-                    symbol, "VWAP Sapması",
-                    "10. tur / uzun tutuş turnuvasında en çok sinyal + en iyi ort. net getiriyi veren sistem",
-                    direction, vrow, breakdown,
-                )
-                fired = True
+                filter_ok, filter_note = passes_trend_funding_filter(symbol, direction, vrow["close"])
+                if not filter_ok:
+                    print(f"{symbol}: VWAP sinyali tespit edildi ama trend/funding filtresine takildi ({filter_note})")
+                else:
+                    breakdown = [
+                        f"✅ VWAP sapması (dinamik eşik): %{vrow['vwap_dev_pct']:+.2f} "
+                        f"(eşik: ±%{vrow['dynamic_vwap_threshold_pct']:.2f})",
+                        f"✅ Trend+Funding: {filter_note}",
+                        f"ℹ️ RSI: {vrow['rsi']:.1f} (bilgi amaçlı, şart değil)",
+                        f"✅ Hacim {vrow['volume']/vrow['vol_sma20']:.2f}x ortalama" if pd.notna(vrow.get('vol_sma20')) and vrow.get('vol_sma20') else "➖ Hacim verisi yetersiz",
+                    ]
+                    ob_support, ob_note = score_orderbook(symbol, direction)
+                    breakdown.append(f"{'✅' if ob_support else '➖'} Order book: {ob_note}")
+                    _emit_signal(
+                        symbol, "VWAP Sapması (dinamik+filtreli)",
+                        "Genisletilmis backtest: Trend+Funding filtreli VWAP, 354 sinyal, %79.9 isabet, +%0.470 ort. net (filtresize gore 2.3x)",
+                        direction, vrow, breakdown,
+                    )
+                    fired = True
 
             zscore_result = check_volume_zscore_gate(df)
             if zscore_result:
                 direction, zrow = zscore_result
-                breakdown = [
-                    f"✅ Hacim Z-Skor: {zrow['vol_zscore']:.2f} (giriş şartı, eşik: {VOLUME_ZSCORE_THRESHOLD})",
-                    f"ℹ️ Mum yönü: {'düşüş (klimaks satış)' if direction == 'LONG' else 'yükseliş (klimaks alım)'}",
-                    f"ℹ️ RSI: {zrow['rsi']:.1f} (bilgi amaçlı, şart değil)",
-                ]
-                ob_support, ob_note = score_orderbook(symbol, direction)
-                breakdown.append(f"{'✅' if ob_support else '➖'} Order book: {ob_note}")
-                _emit_signal(
-                    symbol, "Hacim Z-Skor",
-                    "10. tur turnuvasında 570 sinyal, %72.8 isabet, +%0.371 ort. net getiren ikinci sistem",
-                    direction, zrow, breakdown,
-                )
-                fired = True
+                filter_ok, filter_note = passes_trend_funding_filter(symbol, direction, zrow["close"])
+                if not filter_ok:
+                    print(f"{symbol}: Hacim Z-Skor sinyali tespit edildi ama trend/funding filtresine takildi ({filter_note})")
+                else:
+                    breakdown = [
+                        f"✅ Hacim Z-Skor: {zrow['vol_zscore']:.2f} (giriş şartı, eşik: {VOLUME_ZSCORE_THRESHOLD})",
+                        f"✅ Trend+Funding: {filter_note}",
+                        f"ℹ️ Mum yönü: {'düşüş (klimaks satış)' if direction == 'LONG' else 'yükseliş (klimaks alım)'}",
+                        f"ℹ️ RSI: {zrow['rsi']:.1f} (bilgi amaçlı, şart değil)",
+                    ]
+                    ob_support, ob_note = score_orderbook(symbol, direction)
+                    breakdown.append(f"{'✅' if ob_support else '➖'} Order book: {ob_note}")
+                    _emit_signal(
+                        symbol, "Hacim Z-Skor (filtreli)",
+                        "Genisletilmis backtest: Trend+Funding filtreli Hacim Z-Skor, 412 sinyal, %73.1 isabet, +%0.223 ort. net (filtresiz haliyle canlida zararliydi)",
+                        direction, zrow, breakdown,
+                    )
+                    fired = True
 
             if not fired:
                 print(f"{symbol}: kriter yok")
@@ -872,8 +964,9 @@ def scan_once():
     if closest_long and closest_short:
         print(
             f"[{datetime.now().strftime('%H:%M:%S')}] Tarama bitti - {scanned} coin. "
-            f"Esige en yakin -> LONG: {closest_long[1]} (%{closest_long[0]:+.2f}, esik: %{VWAP_DEV_LONG_MAX}) | "
-            f"SHORT: {closest_short[1]} (%{closest_short[0]:+.2f}, esik: %{VWAP_DEV_SHORT_MIN})"
+            f"Esige en yakin -> LONG: {closest_long[1]} (%{closest_long[0]:+.2f}) | "
+            f"SHORT: {closest_short[1]} (%{closest_short[0]:+.2f}) "
+            f"(esik artik dinamik/coin bazli, sabit degil)"
         )
 
 
