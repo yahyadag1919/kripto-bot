@@ -134,10 +134,21 @@ if USE_TESTNET:
 # Otomatik islem ayarlari
 AUTO_TRADING_ENABLED = os.environ.get("AUTO_TRADING_ENABLED", "false").lower() == "true"
 FULL_AUTO_TRADING = os.environ.get("FULL_AUTO_TRADING", "false").lower() == "true"
-POSITION_PCT_OF_BALANCE = float(os.environ.get("POSITION_PCT_OF_BALANCE", "2"))  # bakiyenin yuzde kaci
+POSITION_PCT_OF_BALANCE = float(os.environ.get("POSITION_PCT_OF_BALANCE", "2"))  # bakiyenin yuzde kaci (marj ust siniri)
 LEVERAGE = int(os.environ.get("LEVERAGE", "20"))
 CONFIRM_TIMEOUT_MINUTES = 15
-STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "3"))  # sabit maks. zarar yuzdesi (fiyat bazinda, kaldiracsiz)
+STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "3"))  # sabit maks. zarar yuzdesi (fiyat bazinda, kaldiracsiz) - ATR yoksa/hesaplanamazsa yedek
+
+# --- Gemini ile birlikte degerlendirilen risk modeli fikirleri ---
+# 1) R-risk modeli: her islemde riske edilecek DOLAR miktari sabittir (bakiyenin
+#    RISK_PER_TRADE_PCT'i), stop mesafesi ise coin'in kendi oynakligina (ATR) gore
+#    belirlenir - boylece BTC'nin %3 hareketiyle oynak bir altcoin'in %3 hareketi
+#    ayni "risk birimi" sayilmaz, pozisyon buyuklugu buna gore kuculur/buyur.
+RISK_PER_TRADE_PCT = float(os.environ.get("RISK_PER_TRADE_PCT", "1"))  # bakiyenin yuzde kaci riske edilecek (R)
+ATR_STOP_MULTIPLIER = float(os.environ.get("ATR_STOP_MULTIPLIER", "1.5"))  # stop mesafesi = ATR14 * bu katsayi
+# 2) Global pozisyon limiti: piyasa tek yone sert kirildiginda botun art arda
+#    onlarca coin'de ayni yonde pozisyon acip kasayi tek yone kilitlemesini onler.
+MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "5"))
 
 # GUVENLIK KILIDI: tam otomasyon + gercek hesap kombinasyonu, ayri bir onay
 # degiskeni olmadan ASLA calismaz - yanlislikla gercek parayla insansiz
@@ -197,42 +208,69 @@ def _set_leverage_safe(symbol: str):
         print(f"Kaldirac ayarlama hatasi ({symbol}): {e}")
 
 
-def _compute_position_size(symbol: str, entry_price: float) -> float:
+def _compute_final_stop_price(direction: str, entry_price: float, invalidation: float, atr14: float = None) -> float:
+    """
+    Uc aday stop seviyesinden (strateji bazli 'gecersizlik', ATR14*ATR_STOP_MULTIPLIER
+    bazli oynaklik-duyarli stop, ve sabit STOP_LOSS_PCT tavani) hangisi girisin daha
+    yakininda ise (yani zarari daha kucuk tutuyorsa) onu secer. STOP_LOSS_PCT boylece
+    her zaman bir "maksimum zarar tavani" gibi calisir, ATR ise coin'in kendi
+    oynakligina gore stop'u makul bir mesafede tutar (Gemini - R-risk modeli).
+    """
+    candidates = [invalidation]
+    if atr14 and atr14 > 0:
+        atr_distance = atr14 * ATR_STOP_MULTIPLIER
+        candidates.append(entry_price - atr_distance if direction == "LONG" else entry_price + atr_distance)
+
+    pct_stop = entry_price * (1 - STOP_LOSS_PCT / 100) if direction == "LONG" else entry_price * (1 + STOP_LOSS_PCT / 100)
+    candidates.append(pct_stop)
+
+    # LONG'da tum adaylar giristen asagida - en yakini (en siki) buyuk olandir.
+    # SHORT'ta tum adaylar giristen yukarida - en yakini (en siki) kucuk olandir.
+    return max(candidates) if direction == "LONG" else min(candidates)
+
+
+def _compute_position_size(symbol: str, entry_price: float, stop_price: float) -> float:
+    """
+    Gemini'nin onerdigi "R-risk" modeli: pozisyon buyuklugu, sabit bir DOLAR riskine
+    (bakiyenin RISK_PER_TRADE_PCT'i) gore, stop mesafesine bolunerek hesaplanir - boylece
+    stop'a takilirsa kaybedilen miktar her zaman ayni (riske edilen tutar) kalir, coin'in
+    oynakligindan (ATR'sinden) bagimsiz olarak. POSITION_PCT_OF_BALANCE*LEVERAGE ise bir
+    UST SINIR (tavan) olarak kalir - asiri dar bir stop'ta pozisyonun cok buyumesini onler.
+    """
     balance = exchange.fetch_balance()
     free_usdt = balance.get("USDT", {}).get("free", 0)
-    position_value = free_usdt * (POSITION_PCT_OF_BALANCE / 100) * LEVERAGE
-    quantity = position_value / entry_price
+
+    stop_distance = abs(entry_price - stop_price)
+    if stop_distance <= 0:
+        return 0
+
+    risk_amount = free_usdt * (RISK_PER_TRADE_PCT / 100)
+    risk_based_qty = risk_amount / stop_distance
+
+    max_notional = free_usdt * (POSITION_PCT_OF_BALANCE / 100) * LEVERAGE
+    max_qty_by_margin = max_notional / entry_price
+
+    quantity = min(risk_based_qty, max_qty_by_margin)
     return float(exchange.amount_to_precision(symbol, quantity))
 
 
-def _compute_final_stop_price(direction: str, entry_price: float, invalidation: float) -> float:
-    """
-    Iki aday stop seviyesinden (strateji bazli 'gecersizlik' ve sabit STOP_LOSS_PCT)
-    hangisi girisin daha yakininda ise (yani zarari daha kucuk tutuyorsa) onu secer.
-    Boylece STOP_LOSS_PCT her zaman bir "maksimum zarar tavani" gibi calisir.
-    """
-    pct_stop = entry_price * (1 - STOP_LOSS_PCT / 100) if direction == "LONG" else entry_price * (1 + STOP_LOSS_PCT / 100)
-    if direction == "LONG":
-        return max(invalidation, pct_stop)  # ikisi de giristen asagida - buyuk olan (giristen yakin) daha sikidir
-    else:
-        return min(invalidation, pct_stop)  # ikisi de giristen yukarida - kucuk olan (giristen yakin) daha sikidir
-
-
-def execute_order(symbol: str, direction: str, entry_price: float, invalidation: float):
-    """Piyasa emriyle pozisyon acar + (gecersizlik seviyesi ile sabit %STOP_LOSS_PCT'den hangisi
-    daha siki ise) koruyucu stop emri birakir - boylece maksimum zarar her zaman sinirli olur.
-    Stop emri HERHANGI bir sebeple basarisiz olursa (orn. fiyat zaten stop seviyesini gecmisse,
-    '-2021 Order would immediately trigger' hatasi), pozisyonu KORUMASIZ birakmak yerine
-    aninda piyasa emriyle kapatir."""
+def execute_order(symbol: str, direction: str, entry_price: float, invalidation: float, atr14: float = None):
+    """Once stop seviyesini (gecersizlik / ATR / sabit % - hangisi en siki ise) belirler,
+    pozisyon buyuklugunu bu stop mesafesine gore (R-risk modeli) hesaplar, piyasa emriyle
+    pozisyonu acar ve koruyucu stop emrini birakir. Stop emri HERHANGI bir sebeple
+    basarisiz olursa (orn. fiyat zaten stop seviyesini gecmisse, '-2021 Order would
+    immediately trigger' hatasi), pozisyonu KORUMASIZ birakmak yerine aninda piyasa
+    emriyle kapatir."""
     _set_leverage_safe(symbol)
     side = "buy" if direction == "LONG" else "sell"
-    qty = _compute_position_size(symbol, entry_price)
+
+    stop_price = _compute_final_stop_price(direction, entry_price, invalidation, atr14)
+    qty = _compute_position_size(symbol, entry_price, stop_price)
     if qty <= 0:
-        raise ValueError("Hesaplanan pozisyon miktari sifir veya negatif - bakiyeni kontrol et.")
+        raise ValueError("Hesaplanan pozisyon miktari sifir veya negatif - bakiyeni/stop mesafesini kontrol et.")
 
     order = exchange.create_order(symbol, type="market", side=side, amount=qty)
 
-    stop_price = _compute_final_stop_price(direction, entry_price, invalidation)
     stop_side = "sell" if direction == "LONG" else "buy"
     try:
         exchange.create_order(
@@ -291,7 +329,9 @@ def process_telegram_updates():
 
         if action == "confirm":
             try:
-                order, qty, stop_price = execute_order(info["symbol"], info["direction"], info["entry_price"], info["invalidation"])
+                order, qty, stop_price = execute_order(
+                    info["symbol"], info["direction"], info["entry_price"], info["invalidation"], info.get("atr14")
+                )
                 send_telegram_message(
                     f"✅ {info['symbol']} {info['direction']} pozisyonu açıldı.\n"
                     f"Miktar: {qty} | Giriş: ~{info['entry_price']:.4f} | Stop: {stop_price:.4f} (maks. %{STOP_LOSS_PCT} zarar)"
@@ -657,6 +697,7 @@ def _emit_signal(symbol: str, strategy: str, strategy_desc: str, direction: str,
 
     invalidation = compute_invalidation(direction, row)
     entry_price = row["close"]
+    atr14 = row["atr14"] if pd.notna(row.get("atr14")) else None
     yon_emoji = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
     breakdown_text = "\n".join(f"- {b}" for b in breakdown)
 
@@ -675,7 +716,7 @@ def _emit_signal(symbol: str, strategy: str, strategy_desc: str, direction: str,
     executed_qty = 0
     if FULL_AUTO_TRADING:
         try:
-            order, executed_qty, stop_price = execute_order(symbol, direction, entry_price, invalidation)
+            order, executed_qty, stop_price = execute_order(symbol, direction, entry_price, invalidation, atr14)
             msg += (
                 f"\n\n🤖 TAM OTOMATİK: pozisyon açıldı.\n"
                 f"Miktar: {executed_qty} | Stop: {stop_price:.4f} (maks. %{STOP_LOSS_PCT} zarar)"
@@ -687,7 +728,7 @@ def _emit_signal(symbol: str, strategy: str, strategy_desc: str, direction: str,
         confirm_id = f"{symbol.replace('/', '').replace(':', '')}-{int(time.time())}"
         PENDING_CONFIRMATIONS[confirm_id] = {
             "symbol": symbol, "direction": direction, "entry_price": entry_price,
-            "invalidation": invalidation, "created_at": datetime.now(),
+            "invalidation": invalidation, "atr14": atr14, "created_at": datetime.now(),
         }
         msg += f"\n\n⚠️ {CONFIRM_TIMEOUT_MINUTES}dk içinde onaylamazsan otomatik iptal olur."
         send_telegram_confirm(msg, confirm_id)
@@ -705,6 +746,16 @@ def scan_once():
     # Ayni coin'de zaten acik/bekleyen bir pozisyon varsa tekrar sinyal
     # uretip ustune emir yigmamak icin - Open Orders'in sismesinin asil sebebi buydu.
     already_open_symbols = {r["symbol"] for r in _read_pending() if r.get("closed", "0") != "1"}
+
+    # Gemini - global risk kilidi: piyasa tek yone sert kirildiginda botun art arda
+    # onlarca coin'de ayni yonde pozisyon acip kasayi tek yone kilitlemesini onler.
+    if FULL_AUTO_TRADING and len(already_open_symbols) >= MAX_OPEN_POSITIONS:
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] MAX_OPEN_POSITIONS limiti "
+            f"({MAX_OPEN_POSITIONS}) dolu ({len(already_open_symbols)} acik pozisyon) - "
+            f"bu tur yeni sinyal aranmadi, mevcut pozisyonlar takip edilmeye devam ediyor."
+        )
+        return
 
     closest_long = None   # (vwap_dev_pct, symbol) - en negatif (LONG esigine en yakin)
     closest_short = None  # (vwap_dev_pct, symbol) - en pozitif (SHORT esigine en yakin)
