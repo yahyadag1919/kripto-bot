@@ -687,12 +687,19 @@ def scan_once():
 
     check_pending_outcomes()
 
+    # Ayni coin'de zaten acik/bekleyen bir pozisyon varsa tekrar sinyal
+    # uretip ustune emir yigmamak icin - Open Orders'in sismesinin asil sebebi buydu.
+    already_open_symbols = {r["symbol"] for r in _read_pending() if r.get("closed", "0") != "1"}
+
     closest_long = None   # (vwap_dev_pct, symbol) - en negatif (LONG esigine en yakin)
     closest_short = None  # (vwap_dev_pct, symbol) - en pozitif (SHORT esigine en yakin)
     scanned = 0
 
     for symbol in WATCHLIST:
         if symbol in _unsupported_symbols:
+            continue
+        if symbol in already_open_symbols:
+            print(f"{symbol}: zaten acik/bekleyen pozisyon var, tekrar sinyal uretilmedi")
             continue
         try:
             df = fetch_ohlcv_df(symbol, TIMEFRAME, limit=100)
