@@ -616,6 +616,39 @@ def check_pending_outcomes():
         qty = float(r.get("qty", 0) or 0)
         closed = False
 
+        # Gercek pozisyon acikken (qty>0), borsada hala var mi diye sor - stop-loss
+        # sessizce tetiklenip pozisyonu kapatmis olabilir, bot bunu fark etmeden
+        # checkpoint'leri beklemeye devam ederse kullanici hicbir bildirim gormez.
+        if qty > 0:
+            try:
+                positions = exchange.fetch_positions([symbol])
+                still_open = any(abs(p.get("contracts") or 0) > 0 for p in positions)
+            except Exception as e:
+                print(f"{symbol}: canli pozisyon kontrolu basarisiz, checkpoint kontrolune devam ediliyor: {e}")
+                still_open = True  # emin olamadigimizda checkpoint akisina birak, yanlislikla "durduruldu" demeyelim
+
+            if not still_open:
+                try:
+                    current_price = exchange.fetch_ticker(symbol)["last"]
+                    raw_pct = (current_price - entry_price) / entry_price * 100
+                    pct_change = raw_pct if direction == "LONG" else -raw_pct
+                except Exception:
+                    current_price = None
+                    pct_change = None
+
+                try:
+                    exchange.cancel_all_orders(symbol)
+                except Exception:
+                    pass
+
+                detay = f"Şimdi: {current_price:.4f} | Değişim: {pct_change:+.2f}%" if current_price is not None else "(fiyat bilgisi alınamadı)"
+                send_telegram_message(
+                    f"🛑 [{strategy}] {symbol} {direction} - pozisyon stop-loss'a takılıp kapanmış görünüyor.\n"
+                    f"Giriş: {entry_price:.4f} | {detay}"
+                )
+                r["closed"] = "1"
+                continue  # bu satir icin checkpoint dongusune hic girme, zaten kapanmis
+
         for minutes, target_pct, label in CHECKPOINTS:
             flag_key = f"checked_{label}"
             if r.get(flag_key, "0") == "1":
