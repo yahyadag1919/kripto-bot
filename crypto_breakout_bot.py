@@ -580,9 +580,8 @@ def check_pending_outcomes():
             flag_key = f"checked_{label}"
             if r.get(flag_key, "0") == "1":
                 continue
-            if now < entry_time + timedelta(minutes=minutes):
-                # bu checkpoint'e daha ulasilmadi, sonraki checkpoint'ler de beklemede
-                break
+
+            time_elapsed = now >= entry_time + timedelta(minutes=minutes)
 
             try:
                 ticker = exchange.fetch_ticker(symbol)
@@ -590,42 +589,58 @@ def check_pending_outcomes():
                 raw_pct_change = (current_price - entry_price) / entry_price * 100
                 pct_change = raw_pct_change if direction == "LONG" else -raw_pct_change
                 success = pct_change >= target_pct
-
-                log_outcome(symbol, strategy, direction, entry_price, r["entry_time"], minutes, label,
-                            target_pct, current_price, pct_change, success)
-                r[flag_key] = "1"
-
-                if success:
-                    close_err = _close_position(symbol, direction, qty)
-                    msg = (
-                        f"🎯 [{strategy}] {symbol} {direction} - {label} checkpoint'te hedef tutturuldu\n"
-                        f"Giriş: {entry_price:.4f} | Şimdi: {current_price:.4f}\n"
-                        f"Değişim: {pct_change:+.2f}% (hedef: %{target_pct})\n\n"
-                        + (f"✅ Pozisyon otomatik kapatıldı."
-                           if qty > 0 and not close_err
-                           else (f"⚠️ Pozisyon kapatma emri başarısız: {close_err}\nManuel kapatmayi unutma!"
-                                 if close_err else "Öneri: kârı realize etmeyi değerlendir."))
-                    )
-                    send_telegram_message(msg)
-                    r["closed"] = "1"
-                    closed = True
-                    break
-                elif label == CHECKPOINTS[-1][2]:
-                    close_err = _close_position(symbol, direction, qty)
-                    msg = (
-                        f"⏱ [{strategy}] {symbol} {direction} - 24sa sonunda hiçbir checkpoint'te hedef tutmadı\n"
-                        f"Giriş: {entry_price:.4f} | Şimdi: {current_price:.4f}\n"
-                        f"Son değişim: {pct_change:+.2f}%\n\n"
-                        + (f"Sinyal geçersiz sayıldı, pozisyon otomatik kapatıldı."
-                           if qty > 0 and not close_err
-                           else (f"⚠️ Pozisyon kapatma emri başarısız: {close_err}\nManuel kapatmayi unutma!"
-                                 if close_err else "Sinyal geçersiz sayılıyor.")))
-                    send_telegram_message(msg)
-                    r["closed"] = "1"
-                    closed = True
             except Exception as e:
                 print(f"{symbol} sonuc kontrolu hatasi: {e}")
                 break
+
+            if success:
+                # Hedefe ulasildi - checkpoint'in zamani gelmemis olsa bile HEMEN kar al,
+                # zaman siniri gelene kadar beklemek kari geri verme riski tasir.
+                log_outcome(symbol, strategy, direction, entry_price, r["entry_time"], minutes, label,
+                            target_pct, current_price, pct_change, success)
+                r[flag_key] = "1"
+                close_err = _close_position(symbol, direction, qty)
+                erken_not = "" if time_elapsed else " (hedef sureden ONCE tutuldu, erken kar alindi)"
+                msg = (
+                    f"🎯 [{strategy}] {symbol} {direction} - {label} hedefte tutturuldu{erken_not}\n"
+                    f"Giriş: {entry_price:.4f} | Şimdi: {current_price:.4f}\n"
+                    f"Değişim: {pct_change:+.2f}% (hedef: %{target_pct})\n\n"
+                    + (f"✅ Pozisyon otomatik kapatıldı."
+                       if qty > 0 and not close_err
+                       else (f"⚠️ Pozisyon kapatma emri başarısız: {close_err}\nManuel kapatmayi unutma!"
+                             if close_err else "Öneri: kârı realize etmeyi değerlendir."))
+                )
+                send_telegram_message(msg)
+                r["closed"] = "1"
+                closed = True
+                break
+
+            if not time_elapsed:
+                # hedef henuz tutmadi VE bu checkpoint'in suresi de dolmadi - bir sonraki
+                # taramada tekrar denenecek, simdilik bekle
+                break
+
+            # hedef tutmadi AMA suresi doldu - bu checkpoint'i "denendi" olarak isaretle,
+            # bir sonraki (daha gevsek) checkpoint'e gec
+            log_outcome(symbol, strategy, direction, entry_price, r["entry_time"], minutes, label,
+                        target_pct, current_price, pct_change, success)
+            r[flag_key] = "1"
+
+            if label == CHECKPOINTS[-1][2]:
+                close_err = _close_position(symbol, direction, qty)
+                msg = (
+                    f"⏱ [{strategy}] {symbol} {direction} - 24sa sonunda hiçbir checkpoint'te hedef tutmadı\n"
+                    f"Giriş: {entry_price:.4f} | Şimdi: {current_price:.4f}\n"
+                    f"Son değişim: {pct_change:+.2f}%\n\n"
+                    + (f"Sinyal geçersiz sayıldı, pozisyon otomatik kapatıldı."
+                       if qty > 0 and not close_err
+                       else (f"⚠️ Pozisyon kapatma emri başarısız: {close_err}\nManuel kapatmayi unutma!"
+                             if close_err else "Sinyal geçersiz sayılıyor.")))
+                send_telegram_message(msg)
+                r["closed"] = "1"
+                closed = True
+                break
+            # son checkpoint degilse dongu devam eder, bir sonraki (daha gevsek) hedefi kontrol eder
 
         if not closed:
             still_pending.append(r)
