@@ -279,16 +279,33 @@ def execute_order(symbol: str, direction: str, entry_price: float, invalidation:
     pozisyonu acar ve koruyucu stop emrini birakir. Stop emri HERHANGI bir sebeple
     basarisiz olursa (orn. fiyat zaten stop seviyesini gecmisse, '-2021 Order would
     immediately trigger' hatasi), pozisyonu KORUMASIZ birakmak yerine aninda piyasa
-    emriyle kapatir."""
+    emriyle kapatir.
+
+    ONEMLI: entry_price parametresi SINYAL ANINDAKI (gecmis, kapanmis mum) fiyattir -
+    tarama ile emrin borsaya ulasmasi arasinda gecen surede (en kotu ihtimalle ~15dk)
+    fiyat kaymis olabilir. Emir doldurulduktan sonra GERCEK dolum fiyatini alip stop/TP'yi
+    ona gore yeniden hesapliyoruz - aksi halde pozisyon "hemen zararda" acilabiliyor ve
+    stop, gercek fiyata gore zaten gecilmis bir seviyede kalip -2021 hatasi verebiliyordu."""
     _set_leverage_safe(symbol)
     side = "buy" if direction == "LONG" else "sell"
 
-    stop_price = _compute_final_stop_price(direction, entry_price, invalidation, atr14)
-    qty = _compute_position_size(symbol, entry_price, stop_price)
+    # sinyal-anindaki fiyatla kabaca stop/qty hesapla - sadece emri gonderebilmek icin
+    provisional_stop = _compute_final_stop_price(direction, entry_price, invalidation, atr14)
+    qty = _compute_position_size(symbol, entry_price, provisional_stop)
     if qty <= 0:
         raise ValueError("Hesaplanan pozisyon miktari sifir veya negatif - bakiyeni/stop mesafesini kontrol et.")
 
     order = exchange.create_order(symbol, type="market", side=side, amount=qty)
+
+    # GERCEK dolum fiyatini al - bundan sonraki tum hesaplamalar buna gore yapilacak
+    real_entry_price = order.get("average") or order.get("price")
+    if not real_entry_price:
+        try:
+            real_entry_price = exchange.fetch_ticker(symbol)["last"]
+        except Exception:
+            real_entry_price = entry_price  # son care
+
+    stop_price = _compute_final_stop_price(direction, real_entry_price, invalidation, atr14)
 
     stop_side = "sell" if direction == "LONG" else "buy"
     try:
@@ -315,7 +332,8 @@ def execute_order(symbol: str, direction: str, entry_price: float, invalidation:
     # hedefler icin) - TP sadece en yakin/en hizli hedefi aninda yakalamak icin var.
     nearest_target_pct = CHECKPOINTS[0][1]
     tp_target_pct = nearest_target_pct + ROUNDTRIP_COMMISSION_PCT
-    tp_price = entry_price * (1 + tp_target_pct / 100) if direction == "LONG" else entry_price * (1 - tp_target_pct / 100)
+    tp_price = (real_entry_price * (1 + tp_target_pct / 100) if direction == "LONG"
+                else real_entry_price * (1 - tp_target_pct / 100))
     tp_side = "sell" if direction == "LONG" else "buy"
     try:
         exchange.create_order(
@@ -327,7 +345,7 @@ def execute_order(symbol: str, direction: str, entry_price: float, invalidation:
         # calisiyor, sadece aninda tetiklenme avantajini kaybederiz.
         print(f"{symbol}: native TP emri eklenemedi ({e}), checkpoint dongusu yedek olarak calisacak")
 
-    return order, qty, stop_price
+    return order, qty, stop_price, real_entry_price
 
 
 def process_telegram_updates():
@@ -366,22 +384,27 @@ def process_telegram_updates():
 
         if action == "confirm":
             try:
-                order, qty, stop_price = execute_order(
+                order, qty, stop_price, real_entry_price = execute_order(
                     info["symbol"], info["direction"], info["entry_price"], info["invalidation"], info.get("atr14")
                 )
-                actual_risk_usd = abs(info["entry_price"] - stop_price) * qty
+                actual_risk_usd = abs(real_entry_price - stop_price) * qty
+                kayma_notu = ""
+                if abs(real_entry_price - info["entry_price"]) / info["entry_price"] * 100 > 0.05:
+                    kayma_notu = f" (sinyal anı: {info['entry_price']:.6f}, fiyat kaymış)"
                 send_telegram_message(
                     f"✅ {info['symbol']} {info['direction']} pozisyonu açıldı.\n"
-                    f"Miktar: {qty} | Giriş: ~{info['entry_price']:.6f} | Stop: {stop_price:.6f}\n"
+                    f"Miktar: {qty} | Gerçek giriş: {real_entry_price:.6f}{kayma_notu} | Stop: {stop_price:.6f}\n"
                     f"Stop'a takılırsa risk edilen: ~{actual_risk_usd:.2f} USDT (bakiyenin ~%{RISK_PER_TRADE_PCT})"
                 )
-                # bu sinyal icin daha once qty=0 ile yazilmis pending kaydini guncelle,
-                # boylece checkpoint sistemi bu gercek pozisyonu daha sonra kapatabilsin
+                # bu sinyal icin daha once qty=0 ile yazilmis pending kaydini guncelle -
+                # GERCEK dolum fiyatiyla, sinyal anindaki eski fiyatla degil, boylece
+                # checkpoint yuzdeleri gercek giristen dogru hesaplanir
                 pending_rows = _read_pending()
                 for pr in pending_rows:
                     if (pr["symbol"] == info["symbol"] and pr["direction"] == info["direction"]
                             and pr.get("closed", "0") == "0" and float(pr.get("qty", 0) or 0) == 0):
                         pr["qty"] = qty
+                        pr["entry_price"] = real_entry_price
                         break
                 _write_pending(pending_rows)
             except Exception as e:
@@ -865,13 +888,18 @@ def _emit_signal(symbol: str, strategy: str, strategy_desc: str, direction: str,
     print(msg)
 
     executed_qty = 0
+    logged_entry_price = entry_price  # gercek doldurma olmazsa (sinyal-amacli/basarisiz) sinyal fiyatina duser
     if FULL_AUTO_TRADING:
         try:
-            order, executed_qty, stop_price = execute_order(symbol, direction, entry_price, invalidation, atr14)
-            actual_risk_usd = abs(entry_price - stop_price) * executed_qty
+            order, executed_qty, stop_price, real_entry_price = execute_order(symbol, direction, entry_price, invalidation, atr14)
+            logged_entry_price = real_entry_price
+            actual_risk_usd = abs(real_entry_price - stop_price) * executed_qty
+            kayma_notu = ""
+            if abs(real_entry_price - entry_price) / entry_price * 100 > 0.05:
+                kayma_notu = f" (sinyal anı: {entry_price:.4f}, fiyat kaymış)"
             msg += (
                 f"\n\n🤖 TAM OTOMATİK: pozisyon açıldı.\n"
-                f"Miktar: {executed_qty} | Stop: {stop_price:.6f}\n"
+                f"Miktar: {executed_qty} | Gerçek giriş: {real_entry_price:.6f}{kayma_notu} | Stop: {stop_price:.6f}\n"
                 f"Stop'a takılırsa risk edilen: ~{actual_risk_usd:.2f} USDT (bakiyenin ~%{RISK_PER_TRADE_PCT})"
             )
         except Exception as e:
@@ -888,7 +916,7 @@ def _emit_signal(symbol: str, strategy: str, strategy_desc: str, direction: str,
     else:
         send_telegram_message(msg)
 
-    log_pending(symbol, strategy, direction, entry_price, datetime.now(), invalidation, qty=executed_qty)
+    log_pending(symbol, strategy, direction, logged_entry_price, datetime.now(), invalidation, qty=executed_qty)
 
 
 def scan_once():
