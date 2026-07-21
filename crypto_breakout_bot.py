@@ -52,7 +52,13 @@ COINS = [
 WATCHLIST = [f"{c}/USDT:USDT" for c in COINS]
 
 TIMEFRAME = "15m"
-CHECK_INTERVAL_MINUTES = 15
+# NOT: sinyaller zaten 15dk'lik KAPANMIS mumlara bakiyor, yani yeni bilgi en
+# fazla 15dk'da bir olusuyor - bunu daha sik kontrol etmek yeni sinyal
+# yaratmaz. Ama mum kapandigi an ile botun bunu FARK ETTIGI an arasindaki
+# gecikmeyi (kotu senaryoda ~15dk'ya kadar cikabiliyordu) azaltmak icin
+# tarama sikligini yukselttik - varsayilan artik 2dk, ayni kapanmis mum
+# kontrol ediliyor olsa bile en gec ~2dk icinde fark edilip islem aciliyor.
+CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "2"))
 
 RSI_PERIOD = 14
 ATR_PERIOD = 14
