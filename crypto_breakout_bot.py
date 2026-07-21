@@ -161,6 +161,14 @@ ATR_STOP_MULTIPLIER = float(os.environ.get("ATR_STOP_MULTIPLIER", "1.5"))  # sto
 #    onlarca coin'de ayni yonde pozisyon acip kasayi tek yone kilitlemesini onler.
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "5"))
 
+# --- Native TP (Take Profit) emri ---
+# Binance'e, checkpoint dongusunun beklemesine gerek kalmadan aninda tetiklenecek
+# bir TP emri de birakiyoruz (en yakin checkpoint hedefinde, 1sa/%0.3). Ama ciplak
+# hedefe TP koyarsak, gidis-donus komisyonu dusuldugunde net kar SIFIRIN ALTINA
+# inebilir - o yuzden TP fiyatina komisyon payini da ekliyoruz, boylece TP
+# tetiklenince gercekten net kardayiz, sadece brut hedefte degil.
+ROUNDTRIP_COMMISSION_PCT = float(os.environ.get("ROUNDTRIP_COMMISSION_PCT", "0.1"))  # Binance USDT-M taker x2 tahmini
+
 # GUVENLIK KILIDI: tam otomasyon + gercek hesap kombinasyonu, ayri bir onay
 # degiskeni olmadan ASLA calismaz - yanlislikla gercek parayla insansiz
 # otomasyona gecmeyi engellemek icin. Testnet'te bu kilit devreye girmez.
@@ -300,6 +308,24 @@ def execute_order(symbol: str, direction: str, entry_price: float, invalidation:
                 f"🚨 {symbol}: hem koruyucu stop ({e}) HEM acil kapama ({close_err}) başarısız oldu! "
                 f"Pozisyonu HEMEN manuel kontrol et!"
             )
+
+    # Native TP: en yakin checkpoint hedefine (1sa/%0.3) KOMISYON PAYI eklenerek
+    # yerlestiriliyor - boylece TP tetiklenirse gercekten net kardayiz, ciplak
+    # brut hedefte degil. Checkpoint dongusu de calismaya devam ediyor (daha uzak
+    # hedefler icin) - TP sadece en yakin/en hizli hedefi aninda yakalamak icin var.
+    nearest_target_pct = CHECKPOINTS[0][1]
+    tp_target_pct = nearest_target_pct + ROUNDTRIP_COMMISSION_PCT
+    tp_price = entry_price * (1 + tp_target_pct / 100) if direction == "LONG" else entry_price * (1 - tp_target_pct / 100)
+    tp_side = "sell" if direction == "LONG" else "buy"
+    try:
+        exchange.create_order(
+            symbol, type="TAKE_PROFIT_MARKET", side=tp_side, amount=qty,
+            params={"stopPrice": tp_price, "reduceOnly": True},
+        )
+    except Exception as e:
+        # TP eklenemezse kritik degil - checkpoint dongusu zaten yedek olarak
+        # calisiyor, sadece aninda tetiklenme avantajini kaybederiz.
+        print(f"{symbol}: native TP emri eklenemedi ({e}), checkpoint dongusu yedek olarak calisacak")
 
     return order, qty, stop_price
 
@@ -731,10 +757,13 @@ def check_pending_outcomes():
                     pass
 
                 detay = f"Şimdi: {current_price:.4f} | Değişim: {pct_change:+.2f}%" if current_price is not None else "(fiyat bilgisi alınamadı)"
-                send_telegram_message(
-                    f"🛑 [{strategy}] {symbol} {direction} - pozisyon stop-loss'a takılıp kapanmış görünüyor.\n"
-                    f"Giriş: {entry_price:.4f} | {detay}"
-                )
+                # pct_change pozitifse muhtemelen TP tetiklenmis (kar), negatifse stop (zarar) -
+                # kesin degil (baska bir yerden de kapanmis olabilir) ama en olasi aciklama bu.
+                if pct_change is not None and pct_change > 0:
+                    baslik = f"🎯 [{strategy}] {symbol} {direction} - pozisyon muhtemelen TP'ye takılıp KARLA kapanmış."
+                else:
+                    baslik = f"🛑 [{strategy}] {symbol} {direction} - pozisyon muhtemelen stop-loss'a takılıp ZARARLA kapanmış."
+                send_telegram_message(f"{baslik}\nGiriş: {entry_price:.4f} | {detay}")
                 r["closed"] = "1"
                 continue  # bu satir icin checkpoint dongusune hic girme, zaten kapanmis
 
