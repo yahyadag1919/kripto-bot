@@ -174,6 +174,12 @@ MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "5"))
 # inebilir - o yuzden TP fiyatina komisyon payini da ekliyoruz, boylece TP
 # tetiklenince gercekten net kardayiz, sadece brut hedefte degil.
 ROUNDTRIP_COMMISSION_PCT = float(os.environ.get("ROUNDTRIP_COMMISSION_PCT", "0.1"))  # Binance USDT-M taker x2 tahmini
+# TP artik SABIT bir yuzdeye (en yakin checkpoint hedefi) degil, STOP MESAFESIYLE
+# ORANTILI olarak yerlestiriliyor - eski yontemde TP (~%0.4) stop mesafesinden
+# (ATR bazli, genelde %1-3) COK dar kaliyordu, bu da yuksek isabet oranina ragmen
+# kucuk-kucuk-kazan-buyuk-kaybet orunusuyle kademeli zarara yol aciyordu (kotu
+# risk/odul orani, gereken breakeven isabet oranini %80-88'e cikariyordu).
+TP_RISK_REWARD_RATIO = float(os.environ.get("TP_RISK_REWARD_RATIO", "1.5"))  # TP mesafesi = stop mesafesi x bu katsayi
 
 # GUVENLIK KILIDI: tam otomasyon + gercek hesap kombinasyonu, ayri bir onay
 # degiskeni olmadan ASLA calismaz - yanlislikla gercek parayla insansiz
@@ -332,12 +338,16 @@ def execute_order(symbol: str, direction: str, entry_price: float, invalidation:
                 f"Pozisyonu HEMEN manuel kontrol et!"
             )
 
-    # Native TP: en yakin checkpoint hedefine (1sa/%0.3) KOMISYON PAYI eklenerek
-    # yerlestiriliyor - boylece TP tetiklenirse gercekten net kardayiz, ciplak
-    # brut hedefte degil. Checkpoint dongusu de calismaya devam ediyor (daha uzak
-    # hedefler icin) - TP sadece en yakin/en hizli hedefi aninda yakalamak icin var.
+    # Native TP: STOP MESAFESIYLE ORANTILI olarak yerlestiriliyor (TP mesafesi =
+    # stop mesafesi x TP_RISK_REWARD_RATIO), sabit bir yuzde DEGIL. Boylece hangi
+    # coin/ne kadar oynak olursa olsun risk/odul orani hep ayni ve lehimize kaliyor -
+    # kazanci, kaybi mesafe olarak daima gecmis oluyor. En yakin checkpoint hedefinin
+    # (nearest_target_pct) ALTINA dusmemesi icin ikisinden buyugu kullaniliyor, komisyon
+    # payi da ustune ekleniyor - boylece hem R:R hem komisyon guvencesi bir arada.
+    stop_distance = abs(real_entry_price - stop_price)
+    rr_based_target_pct = (stop_distance / real_entry_price) * 100 * TP_RISK_REWARD_RATIO
     nearest_target_pct = CHECKPOINTS[0][1]
-    tp_target_pct = nearest_target_pct + ROUNDTRIP_COMMISSION_PCT
+    tp_target_pct = max(rr_based_target_pct, nearest_target_pct) + ROUNDTRIP_COMMISSION_PCT
     tp_price = (real_entry_price * (1 + tp_target_pct / 100) if direction == "LONG"
                 else real_entry_price * (1 - tp_target_pct / 100))
     tp_side = "sell" if direction == "LONG" else "buy"
