@@ -377,6 +377,21 @@ def process_telegram_updates():
 
     for update in data.get("result", []):
         _telegram_update_offset = update["update_id"] + 1
+
+        message = update.get("message")
+        if message:
+            text = (message.get("text") or "").strip().lower()
+            if text.startswith("/stats"):
+                parts = text.split()
+                hours = None
+                if len(parts) > 1:
+                    try:
+                        hours = int(parts[1])
+                    except ValueError:
+                        pass
+                send_telegram_message(build_stats_message(hours))
+            continue
+
         cq = update.get("callback_query")
         if not cq:
             continue
@@ -643,6 +658,82 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SIGNAL_LOG_FILE = os.path.join(DATA_DIR, "signal_history.csv")
 PENDING_FILE = os.path.join(DATA_DIR, "pending_signals.csv")
 OUTCOME_FILE = os.path.join(DATA_DIR, "signal_outcomes.csv")
+# Tum kapanan pozisyonlarin TEK bir yerde toplandigi log - sessiz stop/TP
+# (native emirle borsada kapananlar) DAHIL, kapanis sebebi ne olursa olsun.
+# /stats komutu buradan okuyor. OUTCOME_FILE'dan farkli: OUTCOME_FILE sadece
+# checkpoint dongusunun kendi tetikledigi kapanislari yaziyordu, native
+# STOP_MARKET/TAKE_PROFIT_MARKET emriyle sessizce kapanan (gercek otomatik
+# islemlerin cogunlugu bu sekilde kapaniyor) pozisyonlar hic loglanmiyordu.
+CLOSED_LOG_FILE = os.path.join(DATA_DIR, "closed_trades.csv")
+
+
+def log_closed_trade(symbol, strategy, direction, entry_price, exit_price, pct_change, sonuc):
+    file_exists = os.path.isfile(CLOSED_LOG_FILE)
+    with open(CLOSED_LOG_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow([
+                "timestamp", "symbol", "strategy", "direction", "entry_price",
+                "exit_price", "pct_change", "sonuc"
+            ])
+        writer.writerow([
+            datetime.now().isoformat(), symbol, strategy, direction, entry_price,
+            exit_price if exit_price is not None else "",
+            f"{pct_change:.3f}" if pct_change is not None else "",
+            sonuc,
+        ])
+
+
+def build_stats_message(hours=None):
+    if not os.path.isfile(CLOSED_LOG_FILE):
+        return "Henüz kapanmış işlem kaydı yok."
+    with open(CLOSED_LOG_FILE, newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    if hours:
+        cutoff = datetime.now() - timedelta(hours=hours)
+        rows = [r for r in rows if datetime.fromisoformat(r["timestamp"]) >= cutoff]
+
+    baslik = f"📊 İstatistik (son {hours}sa)" if hours else "📊 İstatistik (tüm zamanlar)"
+    if not rows:
+        return f"{baslik}\nBu aralıkta kapanmış işlem yok."
+
+    total = len(rows)
+    tp_rows = [r for r in rows if r["sonuc"].startswith("TP")]
+    sl_rows = [r for r in rows if not r["sonuc"].startswith("TP")]
+    pct_values = [float(r["pct_change"]) for r in rows if r.get("pct_change")]
+    total_pct = sum(pct_values)
+    avg_pct = total_pct / len(pct_values) if pct_values else 0.0
+    win_rate = len(tp_rows) / total * 100
+
+    open_count = len([r for r in _read_pending() if r.get("closed", "0") != "1"])
+
+    strategy_breakdown = {}
+    for r in rows:
+        s = r.get("strategy", "?")
+        d = strategy_breakdown.setdefault(s, {"tp": 0, "sl": 0, "pct": 0.0})
+        if r["sonuc"].startswith("TP"):
+            d["tp"] += 1
+        else:
+            d["sl"] += 1
+        if r.get("pct_change"):
+            d["pct"] += float(r["pct_change"])
+
+    lines = [
+        baslik,
+        f"Toplam kapanan işlem: {total}",
+        f"TP: {len(tp_rows)} | SL/süre-doldu: {len(sl_rows)} | İsabet: %{win_rate:.1f}",
+        f"Toplam net: %{total_pct:+.2f} | Ort./işlem: %{avg_pct:+.3f}",
+        f"Şu an açık pozisyon: {open_count}",
+        "",
+        "Strateji bazında:",
+    ]
+    for s, d in strategy_breakdown.items():
+        t = d["tp"] + d["sl"]
+        wr = (d["tp"] / t * 100) if t else 0
+        lines.append(f"- {s}: {t} işlem, %{wr:.0f} isabet, toplam %{d['pct']:+.2f}")
+
+    return "\n".join(lines)
 
 
 def log_signal(symbol: str, strategy: str, direction: str, row, breakdown: list):
@@ -800,9 +891,12 @@ def check_pending_outcomes():
                 # kesin degil (baska bir yerden de kapanmis olabilir) ama en olasi aciklama bu.
                 if pct_change is not None and pct_change > 0:
                     baslik = f"🎯 [{strategy}] {symbol} {direction} - pozisyon muhtemelen TP'ye takılıp KARLA kapanmış."
+                    sonuc = "TP (sessiz/native)"
                 else:
                     baslik = f"🛑 [{strategy}] {symbol} {direction} - pozisyon muhtemelen stop-loss'a takılıp ZARARLA kapanmış."
+                    sonuc = "SL (sessiz/native)"
                 send_telegram_message(f"{baslik}\nGiriş: {entry_price:.4f} | {detay}")
+                log_closed_trade(symbol, strategy, direction, entry_price, current_price, pct_change, sonuc)
                 r["closed"] = "1"
                 continue  # bu satir icin checkpoint dongusune hic girme, zaten kapanmis
 
@@ -841,6 +935,7 @@ def check_pending_outcomes():
                              if close_err else "Öneri: kârı realize etmeyi değerlendir."))
                 )
                 send_telegram_message(msg)
+                log_closed_trade(symbol, strategy, direction, entry_price, current_price, pct_change, "TP (checkpoint)")
                 r["closed"] = "1"
                 closed = True
                 break
@@ -867,6 +962,7 @@ def check_pending_outcomes():
                        else (f"⚠️ Pozisyon kapatma emri başarısız: {close_err}\nManuel kapatmayi unutma!"
                              if close_err else "Sinyal geçersiz sayılıyor.")))
                 send_telegram_message(msg)
+                log_closed_trade(symbol, strategy, direction, entry_price, current_price, pct_change, "SL (24sa süre doldu)")
                 r["closed"] = "1"
                 closed = True
                 break
@@ -1088,8 +1184,11 @@ def run_forever():
         elapsed = 0
         poll_interval = 5
         while elapsed < CHECK_INTERVAL_MINUTES * 60:
+            # /stats gibi komutlari her modda (tam otomatik dahil) dinle -
+            # eskiden sadece yari-otomatik modda calisiyordu, tam otomatik
+            # modda /stats hicbir cevap vermiyordu.
+            process_telegram_updates()
             if AUTO_TRADING_ENABLED and not FULL_AUTO_TRADING:
-                process_telegram_updates()
                 expire_old_confirmations()
             time.sleep(poll_interval)
             elapsed += poll_interval
