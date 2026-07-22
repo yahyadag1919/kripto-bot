@@ -154,7 +154,6 @@ FULL_AUTO_TRADING = os.environ.get("FULL_AUTO_TRADING", "false").lower() == "tru
 POSITION_PCT_OF_BALANCE = float(os.environ.get("POSITION_PCT_OF_BALANCE", "2"))  # bakiyenin yuzde kaci (marj ust siniri)
 LEVERAGE = int(os.environ.get("LEVERAGE", "20"))
 CONFIRM_TIMEOUT_MINUTES = 15
-STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "3"))  # sabit maks. zarar yuzdesi (fiyat bazinda, kaldiracsiz) - ATR yoksa/hesaplanamazsa yedek
 
 # --- Gemini ile birlikte degerlendirilen risk modeli fikirleri ---
 # 1) R-risk modeli: her islemde riske edilecek DOLAR miktari sabittir (bakiyenin
@@ -174,7 +173,11 @@ REVERSE_SIGNALS = os.environ.get("REVERSE_SIGNALS", "true").lower() == "true"
 # kullanicinin istedigi gibi sadece komisyonun hemen ustunde, sabit kucuk bir
 # kar hedefi. tp_target_pct = ROUNDTRIP_COMMISSION_PCT + SIMPLE_PROFIT_TARGET_PCT
 SIMPLE_PROFIT_TARGET_PCT = float(os.environ.get("SIMPLE_PROFIT_TARGET_PCT", "0.3"))
-ATR_STOP_MULTIPLIER = float(os.environ.get("ATR_STOP_MULTIPLIER", "1.5"))  # stop mesafesi = ATR14 * bu katsayi
+# Stop da ayni sekilde basitlestirildi: eskiden ATR14*1.5 / gecersizlik / sabit %3
+# tavanindan EN SIKI olani seciliyordu, ama bazi coinlerde bu hala cok genis
+# kalabiliyordu (kucuk TP'ye kiyasla). Artik SABIT ve DAR bir yuzde - TP'ye
+# yakin buyuklukte, kullanicinin "kucuk kar hedefi + dar stop" mantigina uygun.
+SIMPLE_STOP_PCT = float(os.environ.get("SIMPLE_STOP_PCT", "0.6"))
 # 2) Global pozisyon limiti: piyasa tek yone sert kirildiginda botun art arda
 #    onlarca coin'de ayni yonde pozisyon acip kasayi tek yone kilitlemesini onler.
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "5"))
@@ -252,23 +255,14 @@ def _set_leverage_safe(symbol: str):
 
 def _compute_final_stop_price(direction: str, entry_price: float, invalidation: float, atr14: float = None) -> float:
     """
-    Uc aday stop seviyesinden (strateji bazli 'gecersizlik', ATR14*ATR_STOP_MULTIPLIER
-    bazli oynaklik-duyarli stop, ve sabit STOP_LOSS_PCT tavani) hangisi girisin daha
-    yakininda ise (yani zarari daha kucuk tutuyorsa) onu secer. STOP_LOSS_PCT boylece
-    her zaman bir "maksimum zarar tavani" gibi calisir, ATR ise coin'in kendi
-    oynakligina gore stop'u makul bir mesafede tutar (Gemini - R-risk modeli).
+    Basitlestirildi: eskiden 3 farkli aday (strateji-bazli gecersizlik, ATR14
+    bazli, sabit %3 tavan) arasindan en sikisi seciliyordu, ama bu bazi
+    coinlerde hala genis kalip kucuk TP'ye kiyasla oranti bozuyordu. Artik
+    SABIT ve DAR bir yuzde (SIMPLE_STOP_PCT) kullaniliyor - TP ile ayni
+    "basit sabit hedef" mantiginda.
     """
-    candidates = [invalidation]
-    if atr14 and atr14 > 0:
-        atr_distance = atr14 * ATR_STOP_MULTIPLIER
-        candidates.append(entry_price - atr_distance if direction == "LONG" else entry_price + atr_distance)
-
-    pct_stop = entry_price * (1 - STOP_LOSS_PCT / 100) if direction == "LONG" else entry_price * (1 + STOP_LOSS_PCT / 100)
-    candidates.append(pct_stop)
-
-    # LONG'da tum adaylar giristen asagida - en yakini (en siki) buyuk olandir.
-    # SHORT'ta tum adaylar giristen yukarida - en yakini (en siki) kucuk olandir.
-    return max(candidates) if direction == "LONG" else min(candidates)
+    return (entry_price * (1 - SIMPLE_STOP_PCT / 100) if direction == "LONG"
+            else entry_price * (1 + SIMPLE_STOP_PCT / 100))
 
 
 def _compute_position_size(symbol: str, entry_price: float, stop_price: float) -> float:
@@ -1155,14 +1149,14 @@ def run_forever():
     if FULL_AUTO_TRADING:
         mode_text = (
             f"🤖 TAM OTOMATİK MOD AÇIK — sinyaller ONAY BEKLEMEDEN Binance Futures'ta gerçek emir açar "
-            f"(bakiyenin %{POSITION_PCT_OF_BALANCE} | {LEVERAGE}x kaldıraç | maks. %{STOP_LOSS_PCT} zarar stop'u). "
+            f"(bakiyenin %{POSITION_PCT_OF_BALANCE} | {LEVERAGE}x kaldıraç | sabit %{SIMPLE_STOP_PCT} stop'u). "
             f"{'⚠️ TESTNET (sahte para)' if USE_TESTNET else '🔴 GERÇEK HESAP - GERÇEK PARA'}"
         )
     elif AUTO_TRADING_ENABLED:
         mode_text = (
             f"⚡ YARI-OTOMATİK MOD AÇIK — sinyaller Telegram'dan onay bekleyecek, onaylarsan "
             f"Binance Futures'ta gerçek emir açılır (bakiyenin %{POSITION_PCT_OF_BALANCE} | {LEVERAGE}x kaldıraç | "
-            f"maks. %{STOP_LOSS_PCT} zarar stop'u). "
+            f"sabit %{SIMPLE_STOP_PCT} stop'u). "
             f"{'⚠️ TESTNET (sahte para)' if USE_TESTNET else '🔴 GERÇEK HESAP - GERÇEK PARA'}"
         )
     else:
