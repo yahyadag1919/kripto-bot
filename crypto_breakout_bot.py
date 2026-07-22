@@ -162,6 +162,18 @@ STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "3"))  # sabit maks. zarar
 #    belirlenir - boylece BTC'nin %3 hareketiyle oynak bir altcoin'in %3 hareketi
 #    ayni "risk birimi" sayilmaz, pozisyon buyuklugu buna gore kuculur/buyur.
 RISK_PER_TRADE_PCT = float(os.environ.get("RISK_PER_TRADE_PCT", "1"))  # bakiyenin yuzde kaci riske edilecek (R)
+
+# --- Yon tersine cevirme + basit sabit TP ---
+# Backtest edilen 4 farkli yon-tahmini yaklasimi (VWAP, Hacim Z-Skor, Donchian
+# trend-takip, mum momentum) walk-forward testte HICBIRI gercek pozitif edge
+# gostermedi. Kullanicinin talebiyle: sinyal yonu TERSINE cevriliyor (LONG
+# sinyali SHORT olarak aciliyor, SHORT sinyali LONG olarak aciliyor) - test
+# edilmeden, canlida (testnet) denenip gozlemlenecek.
+REVERSE_SIGNALS = os.environ.get("REVERSE_SIGNALS", "true").lower() == "true"
+# TP artik stop mesafesiyle ORANTILI degil (TP_RISK_REWARD_RATIO KULLANILMIYOR) -
+# kullanicinin istedigi gibi sadece komisyonun hemen ustunde, sabit kucuk bir
+# kar hedefi. tp_target_pct = ROUNDTRIP_COMMISSION_PCT + SIMPLE_PROFIT_TARGET_PCT
+SIMPLE_PROFIT_TARGET_PCT = float(os.environ.get("SIMPLE_PROFIT_TARGET_PCT", "0.3"))
 ATR_STOP_MULTIPLIER = float(os.environ.get("ATR_STOP_MULTIPLIER", "1.5"))  # stop mesafesi = ATR14 * bu katsayi
 # 2) Global pozisyon limiti: piyasa tek yone sert kirildiginda botun art arda
 #    onlarca coin'de ayni yonde pozisyon acip kasayi tek yone kilitlemesini onler.
@@ -179,7 +191,6 @@ ROUNDTRIP_COMMISSION_PCT = float(os.environ.get("ROUNDTRIP_COMMISSION_PCT", "0.1
 # (ATR bazli, genelde %1-3) COK dar kaliyordu, bu da yuksek isabet oranina ragmen
 # kucuk-kucuk-kazan-buyuk-kaybet orunusuyle kademeli zarara yol aciyordu (kotu
 # risk/odul orani, gereken breakeven isabet oranini %80-88'e cikariyordu).
-TP_RISK_REWARD_RATIO = float(os.environ.get("TP_RISK_REWARD_RATIO", "1.5"))  # TP mesafesi = stop mesafesi x bu katsayi
 
 # GUVENLIK KILIDI: tam otomasyon + gercek hesap kombinasyonu, ayri bir onay
 # degiskeni olmadan ASLA calismaz - yanlislikla gercek parayla insansiz
@@ -338,16 +349,10 @@ def execute_order(symbol: str, direction: str, entry_price: float, invalidation:
                 f"Pozisyonu HEMEN manuel kontrol et!"
             )
 
-    # Native TP: STOP MESAFESIYLE ORANTILI olarak yerlestiriliyor (TP mesafesi =
-    # stop mesafesi x TP_RISK_REWARD_RATIO), sabit bir yuzde DEGIL. Boylece hangi
-    # coin/ne kadar oynak olursa olsun risk/odul orani hep ayni ve lehimize kaliyor -
-    # kazanci, kaybi mesafe olarak daima gecmis oluyor. En yakin checkpoint hedefinin
-    # (nearest_target_pct) ALTINA dusmemesi icin ikisinden buyugu kullaniliyor, komisyon
-    # payi da ustune ekleniyor - boylece hem R:R hem komisyon guvencesi bir arada.
-    stop_distance = abs(real_entry_price - stop_price)
-    rr_based_target_pct = (stop_distance / real_entry_price) * 100 * TP_RISK_REWARD_RATIO
-    nearest_target_pct = CHECKPOINTS[0][1]
-    tp_target_pct = max(rr_based_target_pct, nearest_target_pct) + ROUNDTRIP_COMMISSION_PCT
+    # Basitlestirilmis TP: stop mesafesiyle ORANTI YOK artik - sadece komisyonun
+    # hemen ustunde, sabit kucuk bir kar hedefi (kullanicinin orijinal manuel
+    # yontemine uygun: "komisyon disinda kucuk bir kar hedefine stop koyuyordum").
+    tp_target_pct = ROUNDTRIP_COMMISSION_PCT + SIMPLE_PROFIT_TARGET_PCT
     tp_price = (real_entry_price * (1 + tp_target_pct / 100) if direction == "LONG"
                 else real_entry_price * (1 - tp_target_pct / 100))
     tp_side = "sell" if direction == "LONG" else "buy"
@@ -1078,13 +1083,16 @@ def scan_once():
             vwap_result = check_breakout_gate(df)
             if vwap_result:
                 direction, vrow = vwap_result
+                if REVERSE_SIGNALS:
+                    direction = "SHORT" if direction == "LONG" else "LONG"
                 filter_ok, filter_note = passes_trend_funding_filter(symbol, direction, vrow["close"])
                 if not filter_ok:
                     print(f"{symbol}: VWAP sinyali tespit edildi ama trend/funding filtresine takildi ({filter_note})")
                 else:
                     breakdown = [
                         f"✅ VWAP sapması (dinamik eşik): %{vrow['vwap_dev_pct']:+.2f} "
-                        f"(eşik: ±%{vrow['dynamic_vwap_threshold_pct']:.2f})",
+                        f"(eşik: ±%{vrow['dynamic_vwap_threshold_pct']:.2f})"
+                        + (" [YÖN TERSİNE ÇEVRİLDİ]" if REVERSE_SIGNALS else ""),
                         f"✅ Trend+Funding: {filter_note}",
                         f"ℹ️ RSI: {vrow['rsi']:.1f} (bilgi amaçlı, şart değil)",
                         f"✅ Hacim {vrow['volume']/vrow['vol_sma20']:.2f}x ortalama" if pd.notna(vrow.get('vol_sma20')) and vrow.get('vol_sma20') else "➖ Hacim verisi yetersiz",
@@ -1101,14 +1109,17 @@ def scan_once():
             zscore_result = check_volume_zscore_gate(df)
             if zscore_result:
                 direction, zrow = zscore_result
+                if REVERSE_SIGNALS:
+                    direction = "SHORT" if direction == "LONG" else "LONG"
                 filter_ok, filter_note = passes_trend_funding_filter(symbol, direction, zrow["close"])
                 if not filter_ok:
                     print(f"{symbol}: Hacim Z-Skor sinyali tespit edildi ama trend/funding filtresine takildi ({filter_note})")
                 else:
                     breakdown = [
-                        f"✅ Hacim Z-Skor: {zrow['vol_zscore']:.2f} (giriş şartı, eşik: {VOLUME_ZSCORE_THRESHOLD})",
+                        f"✅ Hacim Z-Skor: {zrow['vol_zscore']:.2f} (giriş şartı, eşik: {VOLUME_ZSCORE_THRESHOLD})"
+                        + (" [YÖN TERSİNE ÇEVRİLDİ]" if REVERSE_SIGNALS else ""),
                         f"✅ Trend+Funding: {filter_note}",
-                        f"ℹ️ Mum yönü: {'düşüş (klimaks satış)' if direction == 'LONG' else 'yükseliş (klimaks alım)'}",
+                        f"ℹ️ Mum yönü: {'düşüş (klimaks satış)' if direction == 'SHORT' else 'yükseliş (klimaks alım)'}",
                         f"ℹ️ RSI: {zrow['rsi']:.1f} (bilgi amaçlı, şart değil)",
                     ]
                     ob_support, ob_note = score_orderbook(symbol, direction)
@@ -1172,6 +1183,8 @@ def run_forever():
         "İki bağımsız sinyal kolu çalışıyor:\n"
         f"1) VWAP Sapması: fiyat kayan VWAP'tan %2+ sapmış\n"
         f"2) Hacim Z-Skor: hacim, son 20 mumun ortalamasından z-skor≥{VOLUME_ZSCORE_THRESHOLD} sapmış (klimaks hacim)\n\n"
+        + (f"🔄 YÖN TERSİNE ÇEVRİLDİ: sinyal LONG derse SHORT, SHORT derse LONG açılıyor.\n\n" if REVERSE_SIGNALS else "")
+        + f"🎯 TP: sabit, komisyon + %{SIMPLE_PROFIT_TARGET_PCT} (basit, stop mesafesiyle orantı yok)\n\n"
         f"Checkpoint hedefleri: {checkpoint_text}\n"
         f"En fazla {MAX_HOLD_MINUTES // 60}sa tutuş, her checkpoint'te otomatik durum bildirimi gelecek.\n\n"
         f"{mode_text}\n\n"
