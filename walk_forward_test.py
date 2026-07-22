@@ -41,12 +41,30 @@ public API rate limitine takilmamak icin coin sayisini/suresini asagidan
 degistirebilirsin).
 """
 
+import os
 import time
 from datetime import datetime, timedelta
 
 import ccxt
 import numpy as np
 import pandas as pd
+import requests
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+
+def send_telegram_message(text: str):
+    """TELEGRAM_TOKEN/TELEGRAM_CHAT_ID ayarliysa (canli bottakiyle AYNI degiskenler,
+    Railway'de zaten tanimli) sonucu Telegram'a da gonderir - telefondan takip
+    edebilmek icin. Ayarli degilse sadece konsola yazar (sessizce atlar)."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
+    except Exception as e:
+        print(f"Telegram gonderim hatasi: {e}")
 
 # ---------------------------------------------------------------------------
 # Ayarlar - canli bottaki degerlerle AYNI tutuldu, burada YENI bir optimizasyon
@@ -174,6 +192,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def attach_4h_trend(df_15m: pd.DataFrame, df_4h: pd.DataFrame) -> pd.DataFrame:
+    df_15m = df_15m.drop(columns=["ema200_4h"], errors="ignore")  # compute_indicators'daki bos placeholder'i sil, cakisma yaratmasin
     df_4h = df_4h.copy()
     df_4h["ema200"] = df_4h["close"].ewm(span=TREND_EMA_PERIOD, adjust=False).mean()
     df_4h = df_4h[["timestamp", "ema200"]].sort_values("timestamp")
@@ -319,6 +338,10 @@ def print_summary(s: dict):
 
 def main():
     print(f"Walk-forward test basliyor - {len(COINS)} coin, {DAYS_OF_HISTORY} gun, TRAIN/TEST bolme: %{int(TRAIN_FRACTION*100)}/%{int((1-TRAIN_FRACTION)*100)}\n")
+    send_telegram_message(
+        f"🔬 Walk-forward test başladı ({len(COINS)} coin, {DAYS_OF_HISTORY} gün). "
+        f"Bitince sonuç buraya gelecek, biraz sürebilir..."
+    )
 
     results = {"vwap": {"train": [], "test": []}, "zscore": {"train": [], "test": []}}
 
@@ -351,11 +374,32 @@ def main():
             results[strategy]["test"] += test_trades
 
     print("\n================= SONUC (tum coinler birlesik) =================\n")
+    lines = ["📊 Walk-forward test SONUÇ (tüm coinler birleşik):\n"]
     for strategy, label in [("vwap", "VWAP Sapması"), ("zscore", "Hacim Z-Skor")]:
         print(f"{label}:")
-        print_summary(summarize(results[strategy]["train"], "TRAIN (ilk %60)"))
-        print_summary(summarize(results[strategy]["test"], "TEST  (son %40, hic gorulmemis)"))
+        train_s = summarize(results[strategy]["train"], "TRAIN (ilk %60)")
+        test_s = summarize(results[strategy]["test"], "TEST  (son %40, hic gorulmemis)")
+        print_summary(train_s)
+        print_summary(test_s)
         print()
+
+        lines.append(f"{label}:")
+        for s in (train_s, test_s):
+            if s["n"] == 0:
+                lines.append(f"  {s['label']}: sinyal yok")
+            else:
+                lines.append(
+                    f"  {s['label']}: {s['n']} işlem | isabet %{s['hit_rate']:.1f} | "
+                    f"ort. net %{s['avg_net']:+.3f} | toplam net %{s['total_net']:+.2f}"
+                )
+        lines.append("")
+
+    lines.append(
+        "Yorum: TEST, TRAIN'e yakınsa edge gerçek olabilir. TEST'te ort. net "
+        "% ciddi düşüyorsa (özellikle eksiye dönüyorsa) TRAIN'deki başarı "
+        "muhtemelen overfit/rastlantısal."
+    )
+    send_telegram_message("\n".join(lines))
 
     print("YORUM: TEST sonuclari TRAIN'e yakinsa edge gercek olabilir.")
     print("TEST'te ort. net % TRAIN'e gore ciddi dusuyorsa (ozellikle negatife")
