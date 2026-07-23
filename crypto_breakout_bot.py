@@ -197,7 +197,12 @@ DONCHIAN_PERIOD = int(os.environ.get("DONCHIAN_PERIOD", "55"))
 DONCHIAN_TREND_EMA_PERIOD = int(os.environ.get("DONCHIAN_TREND_EMA_PERIOD_ENV", "200"))
 CHANDELIER_MULT = 3.0        # trailing stop mesafesi = ATR14(4h) * bu katsayi
 DONCHIAN_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "donchian_positions.csv")
-DONCHIAN_FIELDNAMES = ["symbol", "direction", "entry_price", "stop_price", "extreme_price", "entry_time"]
+DONCHIAN_FIELDNAMES = ["symbol", "direction", "signal_direction", "entry_price", "stop_price", "extreme_price", "entry_time"]
+# Sinyal tespit MANTIGI (Donchian kirilim + trend filtresi) KESINLIKLE degismiyor -
+# kullanicinin acikca istedigi gibi. Sadece GERCEK ISLEM ters yonde aciliyor,
+# Telegram bildirimi ise sinyalin ORIJINAL yonunu gostermeye devam ediyor
+# (yani LONG sinyali gelirse bildirim hala "LONG" yazar, ama borsada SHORT acilir).
+DONCHIAN_INVERT_EXECUTION = os.environ.get("DONCHIAN_INVERT_EXECUTION", "true").lower() == "true"
 
 # --- Native TP (Take Profit) emri ---
 # Binance'e, checkpoint dongusunun beklemesine gerek kalmadan aninda tetiklenecek
@@ -631,13 +636,19 @@ def _write_donchian_positions(rows):
         writer.writerows(rows)
 
 
-def open_donchian_position(symbol: str, direction: str, entry_price: float, atr14: float):
-    """execute_order'a benzer ama TP YOK (sadece chandelier trailing stop ile
-    kazananin buyumesine izin veriliyor) ve stop mesafesi ATR14*CHANDELIER_MULT."""
-    _set_leverage_safe(symbol)
-    side = "buy" if direction == "LONG" else "sell"
+def open_donchian_position(symbol: str, signal_direction: str, entry_price: float, atr14: float):
+    """SINYAL TESPITI (Donchian kirilim + trend filtresi) hic degismiyor - signal_direction
+    parametresi dogrudan check_donchian_gate'in urettigi ORIJINAL yondur, DOKUNULMUYOR.
+    Sadece GERCEK ISLEM, DONCHIAN_INVERT_EXECUTION acikken TERS yonde aciliyor - Telegram
+    bildirimi ise HER ZAMAN sinyalin orijinal yonunu gosterir (kullanicinin acik istegi:
+    'bildirim aynı gelsin, ama tersine işlem açılsın')."""
+    trade_direction = (("SHORT" if signal_direction == "LONG" else "LONG")
+                        if DONCHIAN_INVERT_EXECUTION else signal_direction)
 
-    provisional_stop = (entry_price - atr14 * CHANDELIER_MULT if direction == "LONG"
+    _set_leverage_safe(symbol)
+    side = "buy" if trade_direction == "LONG" else "sell"
+
+    provisional_stop = (entry_price - atr14 * CHANDELIER_MULT if trade_direction == "LONG"
                          else entry_price + atr14 * CHANDELIER_MULT)
     qty = _compute_position_size(symbol, entry_price, provisional_stop)
     if qty <= 0:
@@ -651,16 +662,16 @@ def open_donchian_position(symbol: str, direction: str, entry_price: float, atr1
         except Exception:
             real_entry_price = entry_price
 
-    stop_price = (real_entry_price - atr14 * CHANDELIER_MULT if direction == "LONG"
+    stop_price = (real_entry_price - atr14 * CHANDELIER_MULT if trade_direction == "LONG"
                   else real_entry_price + atr14 * CHANDELIER_MULT)
-    stop_side = "sell" if direction == "LONG" else "buy"
+    stop_side = "sell" if trade_direction == "LONG" else "buy"
     try:
         exchange.create_order(
             symbol, type="STOP_MARKET", side=stop_side, amount=qty,
             params={"stopPrice": stop_price, "reduceOnly": True},
         )
     except Exception as e:
-        close_err = _close_position(symbol, direction, qty)
+        close_err = _close_position(symbol, trade_direction, qty)
         send_telegram_message(
             f"⚠️ {symbol} (Donchian): koruyucu stop emri başarısız oldu ({e}) — "
             f"pozisyon {'kapatıldı' if not close_err else 'KAPATILAMADI, MANUEL KONTROL ET: ' + close_err}."
@@ -669,14 +680,14 @@ def open_donchian_position(symbol: str, direction: str, entry_price: float, atr1
 
     rows = _read_donchian_positions()
     rows.append({
-        "symbol": symbol, "direction": direction, "entry_price": real_entry_price,
-        "stop_price": stop_price, "extreme_price": real_entry_price,
+        "symbol": symbol, "direction": trade_direction, "signal_direction": signal_direction,
+        "entry_price": real_entry_price, "stop_price": stop_price, "extreme_price": real_entry_price,
         "entry_time": datetime.now().isoformat(),
     })
     _write_donchian_positions(rows)
 
     send_telegram_message(
-        f"🐢 [Donchian Trend-Takip - ORİJİNAL yön] {symbol} {direction} pozisyon açıldı.\n"
+        f"🐢 [Donchian Trend-Takip - ORİJİNAL yön] {symbol} {signal_direction} pozisyon açıldı.\n"
         f"Giriş: {real_entry_price:.6f} | İlk stop: {stop_price:.6f} (ATR×{CHANDELIER_MULT})\n"
         f"Bu strateji şu ana kadarki testlerde EN KÖTÜ çıkan sonuçtu (en düşük isabet, "
         f"en büyük kayıp) — kullanıcı isteğiyle tersine çevrilmeden, olduğu gibi deneniyor.\n"
@@ -696,7 +707,8 @@ def update_donchian_trailing_stops():
 
     for r in rows:
         symbol = r["symbol"]
-        direction = r["direction"]
+        direction = r["direction"]  # GERCEK islem yonu - pct hesap ve pozisyon sorgusu icin
+        signal_direction = r.get("signal_direction", direction)  # bildirimde gosterilecek, sinyalin orijinal yonu
         entry_price = float(r["entry_price"])
         current_stop = float(r["stop_price"])
         extreme = float(r["extreme_price"])
@@ -717,9 +729,9 @@ def update_donchian_trailing_stops():
             raw_pct = (current_price - entry_price) / entry_price * 100
             pct_change = raw_pct if direction == "LONG" else -raw_pct
             sonuc = "TP (trailing, sessiz)" if pct_change > 0 else "SL (trailing, sessiz)"
-            log_closed_trade(symbol, "Donchian Trend-Takip (orijinal)", direction, entry_price, current_price, pct_change, sonuc)
+            log_closed_trade(symbol, "Donchian Trend-Takip (orijinal)", signal_direction, entry_price, current_price, pct_change, sonuc)
             send_telegram_message(
-                f"🐢 [Donchian] {symbol} {direction} pozisyon kapanmış (trailing stop'a takılmış). "
+                f"🐢 [Donchian] {symbol} {signal_direction} pozisyon kapanmış (trailing stop'a takılmış). "
                 f"Giriş: {entry_price:.6f} | Şimdi: {current_price:.6f} | Değişim: {pct_change:+.2f}%"
             )
             continue
