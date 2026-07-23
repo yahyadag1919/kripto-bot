@@ -182,6 +182,23 @@ SIMPLE_STOP_PCT = float(os.environ.get("SIMPLE_STOP_PCT", "0.6"))
 #    onlarca coin'de ayni yonde pozisyon acip kasayi tek yone kilitlemesini onler.
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "5"))
 
+# --- DONCHIAN TREND-TAKIP MODU ---
+# Kullanicinin talebiyle: su ana kadarki TUM testlerde en kotu (en dusuk isabet
+# orani %28.1, en buyuk ort. kayip -%1.9/islem) cikan strateji - Donchian(55)
+# kirilim + EMA200 trend filtresi + ATR chandelier trailing stop - AYNEN
+# ORIJINAL (TERSINE CEVRILMEDEN) haliyle canliya deniyor. Amac: "testlere
+# guvenmiyorum, en kotu cikani oldugu gibi canlida gozlemleyelim" talebi.
+# ETKINLESTIRILINCE VWAP Sapmasi + Hacim Z-Skor sinyalleri DEVRE DISI kalir,
+# bunun yerine SADECE Donchian sinyali calisir - REVERSE_SIGNALS bu moddan
+# ETKILENMEZ (kullanici acikca "tersine degil, orijinal" dedi).
+DONCHIAN_MODE = os.environ.get("DONCHIAN_MODE", "false").lower() == "true"
+DONCHIAN_TIMEFRAME = "4h"
+DONCHIAN_PERIOD = 55
+DONCHIAN_TREND_EMA_PERIOD = 200
+CHANDELIER_MULT = 3.0        # trailing stop mesafesi = ATR14(4h) * bu katsayi
+DONCHIAN_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "donchian_positions.csv")
+DONCHIAN_FIELDNAMES = ["symbol", "direction", "entry_price", "stop_price", "extreme_price", "entry_time"]
+
 # --- Native TP (Take Profit) emri ---
 # Binance'e, checkpoint dongusunun beklemesine gerek kalmadan aninda tetiklenecek
 # bir TP emri de birakiyoruz (en yakin checkpoint hedefinde, 1sa/%0.3). Ama ciplak
@@ -560,7 +577,224 @@ def check_volume_zscore_gate(df: pd.DataFrame):
     return None
 
 
-def score_orderbook(symbol: str, direction: str) -> tuple:
+# ---------------------------------------------------------------------------
+# DONCHIAN TREND-TAKIP MODU - ayri, kendi kendine yeten bir alt-sistem.
+# VWAP/Hacim Z-Skor'un checkpoint tabanli cikis mantigindan TAMAMEN bagimsiz -
+# kendi CSV dosyasinda pozisyon takibi yapiyor, kendi trailing-stop dongusu var.
+# ---------------------------------------------------------------------------
+
+def fetch_donchian_ohlcv_df(symbol: str, limit: int = 300) -> pd.DataFrame:
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=DONCHIAN_TIMEFRAME, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    return df
+
+
+def compute_donchian_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["donchian_high"] = df["high"].shift(1).rolling(DONCHIAN_PERIOD).max()
+    df["donchian_low"] = df["low"].shift(1).rolling(DONCHIAN_PERIOD).min()
+    df["ema_trend"] = df["close"].ewm(span=DONCHIAN_TREND_EMA_PERIOD, adjust=False).mean()
+
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close = (df["low"] - df["close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df["atr14"] = tr.rolling(ATR_PERIOD).mean()
+    return df
+
+
+def check_donchian_gate(df: pd.DataFrame):
+    """ORIJINAL yon - REVERSE_SIGNALS'tan etkilenmez, kullanicinin istegiyle
+    ayni sekilde (tersine cevirmeden) test edilmesi icin."""
+    row = df.iloc[-2]
+    if pd.isna(row.get("donchian_high")) or pd.isna(row.get("ema_trend")) or pd.isna(row.get("atr14")):
+        return None
+    if row["close"] > row["donchian_high"] and row["close"] > row["ema_trend"]:
+        return "LONG", row
+    elif row["close"] < row["donchian_low"] and row["close"] < row["ema_trend"]:
+        return "SHORT", row
+    return None
+
+
+def _read_donchian_positions():
+    if not os.path.isfile(DONCHIAN_STATE_FILE):
+        return []
+    with open(DONCHIAN_STATE_FILE, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _write_donchian_positions(rows):
+    with open(DONCHIAN_STATE_FILE, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=DONCHIAN_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def open_donchian_position(symbol: str, direction: str, entry_price: float, atr14: float):
+    """execute_order'a benzer ama TP YOK (sadece chandelier trailing stop ile
+    kazananin buyumesine izin veriliyor) ve stop mesafesi ATR14*CHANDELIER_MULT."""
+    _set_leverage_safe(symbol)
+    side = "buy" if direction == "LONG" else "sell"
+
+    provisional_stop = (entry_price - atr14 * CHANDELIER_MULT if direction == "LONG"
+                         else entry_price + atr14 * CHANDELIER_MULT)
+    qty = _compute_position_size(symbol, entry_price, provisional_stop)
+    if qty <= 0:
+        raise ValueError("Hesaplanan pozisyon miktari sifir veya negatif.")
+
+    order = exchange.create_order(symbol, type="market", side=side, amount=qty)
+    real_entry_price = order.get("average") or order.get("price")
+    if not real_entry_price:
+        try:
+            real_entry_price = exchange.fetch_ticker(symbol)["last"]
+        except Exception:
+            real_entry_price = entry_price
+
+    stop_price = (real_entry_price - atr14 * CHANDELIER_MULT if direction == "LONG"
+                  else real_entry_price + atr14 * CHANDELIER_MULT)
+    stop_side = "sell" if direction == "LONG" else "buy"
+    try:
+        exchange.create_order(
+            symbol, type="STOP_MARKET", side=stop_side, amount=qty,
+            params={"stopPrice": stop_price, "reduceOnly": True},
+        )
+    except Exception as e:
+        close_err = _close_position(symbol, direction, qty)
+        send_telegram_message(
+            f"⚠️ {symbol} (Donchian): koruyucu stop emri başarısız oldu ({e}) — "
+            f"pozisyon {'kapatıldı' if not close_err else 'KAPATILAMADI, MANUEL KONTROL ET: ' + close_err}."
+        )
+        return None
+
+    rows = _read_donchian_positions()
+    rows.append({
+        "symbol": symbol, "direction": direction, "entry_price": real_entry_price,
+        "stop_price": stop_price, "extreme_price": real_entry_price,
+        "entry_time": datetime.now().isoformat(),
+    })
+    _write_donchian_positions(rows)
+
+    send_telegram_message(
+        f"🐢 [Donchian Trend-Takip - ORİJİNAL yön] {symbol} {direction} pozisyon açıldı.\n"
+        f"Giriş: {real_entry_price:.6f} | İlk stop: {stop_price:.6f} (ATR×{CHANDELIER_MULT})\n"
+        f"Bu strateji şu ana kadarki testlerde EN KÖTÜ çıkan sonuçtu (en düşük isabet, "
+        f"en büyük kayıp) — kullanıcı isteğiyle tersine çevrilmeden, olduğu gibi deneniyor.\n"
+        f"TP YOK — sadece trailing stop kazananın büyümesine izin veriyor."
+    )
+    return qty
+
+
+def update_donchian_trailing_stops():
+    """Her tarama dongusunde: acik Donchian pozisyonlarinin hala borsada acik olup
+    olmadigini kontrol eder (stop'a takilip sessizce kapanmis olabilir), acik
+    olanlarin trailing stop'unu (sadece kar yonunde) gunceller."""
+    rows = _read_donchian_positions()
+    if not rows:
+        return
+    still_open = []
+
+    for r in rows:
+        symbol = r["symbol"]
+        direction = r["direction"]
+        entry_price = float(r["entry_price"])
+        current_stop = float(r["stop_price"])
+        extreme = float(r["extreme_price"])
+
+        try:
+            positions = exchange.fetch_positions([symbol])
+            live_qty = sum(abs(float(p.get("contracts") or 0)) for p in positions if p.get("symbol") == symbol)
+        except Exception as e:
+            print(f"{symbol} (Donchian): pozisyon sorgulanamadi ({e}), bir sonraki tura birakildi")
+            still_open.append(r)
+            continue
+
+        if live_qty <= 0:
+            try:
+                current_price = exchange.fetch_ticker(symbol)["last"]
+            except Exception:
+                current_price = current_stop
+            raw_pct = (current_price - entry_price) / entry_price * 100
+            pct_change = raw_pct if direction == "LONG" else -raw_pct
+            sonuc = "TP (trailing, sessiz)" if pct_change > 0 else "SL (trailing, sessiz)"
+            log_closed_trade(symbol, "Donchian Trend-Takip (orijinal)", direction, entry_price, current_price, pct_change, sonuc)
+            send_telegram_message(
+                f"🐢 [Donchian] {symbol} {direction} pozisyon kapanmış (trailing stop'a takılmış). "
+                f"Giriş: {entry_price:.6f} | Şimdi: {current_price:.6f} | Değişim: {pct_change:+.2f}%"
+            )
+            continue
+
+        try:
+            df = fetch_donchian_ohlcv_df(symbol, limit=DONCHIAN_TREND_EMA_PERIOD + 30)
+            df = compute_donchian_indicators(df)
+            last_row = df.iloc[-2]
+            latest_close = last_row["close"]
+            latest_atr = last_row["atr14"]
+        except Exception as e:
+            print(f"{symbol} (Donchian): 4h veri cekilemedi, trailing stop guncellenmedi ({e})")
+            still_open.append(r)
+            continue
+
+        if pd.isna(latest_atr):
+            still_open.append(r)
+            continue
+
+        if direction == "LONG":
+            new_extreme = max(extreme, latest_close)
+            candidate_stop = new_extreme - latest_atr * CHANDELIER_MULT
+            new_stop = max(current_stop, candidate_stop)
+        else:
+            new_extreme = min(extreme, latest_close)
+            candidate_stop = new_extreme + latest_atr * CHANDELIER_MULT
+            new_stop = min(current_stop, candidate_stop)
+
+        if new_stop != current_stop:
+            try:
+                exchange.cancel_all_orders(symbol)
+                stop_side = "sell" if direction == "LONG" else "buy"
+                exchange.create_order(
+                    symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
+                    params={"stopPrice": new_stop, "reduceOnly": True},
+                )
+                r["stop_price"] = str(new_stop)
+                r["extreme_price"] = str(new_extreme)
+                print(f"{symbol} (Donchian): trailing stop güncellendi {current_stop:.6f} -> {new_stop:.6f}")
+            except Exception as e:
+                print(f"{symbol} (Donchian): trailing stop güncellenemedi ({e}), eski stop korunuyor")
+
+        still_open.append(r)
+
+    _write_donchian_positions(still_open)
+
+
+def scan_donchian_once():
+    """VWAP/Hacim Z-Skor'dan bagimsiz, ayri bir tarama: Donchian kirilim sinyali
+    arar, bulursa ORIJINAL yonde (tersine cevirmeden) pozisyon acar."""
+    open_symbols = {r["symbol"] for r in _read_donchian_positions()}
+    if len(open_symbols) >= MAX_OPEN_POSITIONS:
+        return
+
+    for symbol in WATCHLIST:
+        if symbol in _unsupported_symbols or symbol in open_symbols:
+            continue
+        try:
+            df = fetch_donchian_ohlcv_df(symbol, limit=DONCHIAN_TREND_EMA_PERIOD + 30)
+            df = compute_donchian_indicators(df)
+            result = check_donchian_gate(df)
+            if not result:
+                continue
+            direction, row = result
+            open_donchian_position(symbol, direction, row["close"], row["atr14"])
+            if len(_read_donchian_positions()) >= MAX_OPEN_POSITIONS:
+                break
+        except Exception as e:
+            if "does not have" in str(e).lower():
+                _unsupported_symbols.add(symbol)
+            else:
+                print(f"{symbol} (Donchian) hata: {e}")
+
+
+
     try:
         ob = exchange.fetch_order_book(symbol, limit=20)
         bid_vol = sum(b[1] for b in ob["bids"])
@@ -1033,6 +1267,13 @@ def _emit_signal(symbol: str, strategy: str, strategy_desc: str, direction: str,
 def scan_once():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Tarama basliyor...")
 
+    if DONCHIAN_MODE:
+        # VWAP/Hacim Z-Skor sinyalleri bu modda DEVRE DISI - kullanicinin
+        # istegiyle sadece Donchian trend-takip (orijinal yon) calisiyor.
+        update_donchian_trailing_stops()
+        scan_donchian_once()
+        return
+
     check_pending_outcomes()
 
     # Ayni coin'de zaten acik/bekleyen bir pozisyon varsa tekrar sinyal
@@ -1171,19 +1412,32 @@ def run_forever():
              "pozisyon takibi bir sonraki deploy'da/restart'ta silinecek."
     )
 
-    send_telegram_message(
-        "Kripto botu (VWAP Sapması + Hacim Z-Skor) başlatıldı.\n"
-        f"{len(WATCHLIST)} coin taranıyor.\n\n"
-        "İki bağımsız sinyal kolu çalışıyor:\n"
-        f"1) VWAP Sapması: fiyat kayan VWAP'tan %2+ sapmış\n"
-        f"2) Hacim Z-Skor: hacim, son 20 mumun ortalamasından z-skor≥{VOLUME_ZSCORE_THRESHOLD} sapmış (klimaks hacim)\n\n"
-        + (f"🔄 YÖN TERSİNE ÇEVRİLDİ: sinyal LONG derse SHORT, SHORT derse LONG açılıyor.\n\n" if REVERSE_SIGNALS else "")
-        + f"🎯 TP: sabit, komisyon + %{SIMPLE_PROFIT_TARGET_PCT} (basit, stop mesafesiyle orantı yok)\n\n"
-        f"Checkpoint hedefleri: {checkpoint_text}\n"
-        f"En fazla {MAX_HOLD_MINUTES // 60}sa tutuş, her checkpoint'te otomatik durum bildirimi gelecek.\n\n"
-        f"{mode_text}\n\n"
-        f"{persistence_note}"
-    )
+    if DONCHIAN_MODE:
+        recovered_donchian = _read_donchian_positions()
+        send_telegram_message(
+            "🐢 Kripto botu (DONCHIAN TREND-TAKİP - ORİJİNAL yön) başlatıldı.\n"
+            f"{len(WATCHLIST)} coin taranıyor, {DONCHIAN_TIMEFRAME} mumla.\n\n"
+            f"Strateji: Donchian({DONCHIAN_PERIOD}) kırılım + EMA{DONCHIAN_TREND_EMA_PERIOD} trend filtresi, "
+            f"ATR×{CHANDELIER_MULT} chandelier trailing stop. TP YOK — kazananın büyümesine izin veriliyor.\n\n"
+            "⚠️ Bu strateji, şu ana kadarki TÜM testlerde EN KÖTÜ çıkan sonuçtu (isabet %28.1, "
+            "ort. -%1.9/işlem) — kullanıcı isteğiyle tersine çevrilmeden, olduğu gibi canlıda deneniyor.\n\n"
+            f"{mode_text}\n\n"
+            f"💾 {len(recovered_donchian)} açık Donchian pozisyonu geri yüklendi (varsa)."
+        )
+    else:
+        send_telegram_message(
+            "Kripto botu (VWAP Sapması + Hacim Z-Skor) başlatıldı.\n"
+            f"{len(WATCHLIST)} coin taranıyor.\n\n"
+            "İki bağımsız sinyal kolu çalışıyor:\n"
+            f"1) VWAP Sapması: fiyat kayan VWAP'tan %2+ sapmış\n"
+            f"2) Hacim Z-Skor: hacim, son 20 mumun ortalamasından z-skor≥{VOLUME_ZSCORE_THRESHOLD} sapmış (klimaks hacim)\n\n"
+            + (f"🔄 YÖN TERSİNE ÇEVRİLDİ: sinyal LONG derse SHORT, SHORT derse LONG açılıyor.\n\n" if REVERSE_SIGNALS else "")
+            + f"🎯 TP: sabit, komisyon + %{SIMPLE_PROFIT_TARGET_PCT} (basit, stop mesafesiyle orantı yok)\n\n"
+            f"Checkpoint hedefleri: {checkpoint_text}\n"
+            f"En fazla {MAX_HOLD_MINUTES // 60}sa tutuş, her checkpoint'te otomatik durum bildirimi gelecek.\n\n"
+            f"{mode_text}\n\n"
+            f"{persistence_note}"
+        )
     while True:
         scan_once()
         # bir sonraki taramaya kadar Telegram buton tikla olaylarini sik sik kontrol et
