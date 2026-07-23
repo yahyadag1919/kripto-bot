@@ -835,6 +835,25 @@ def update_donchian_trailing_stops():
             )
             continue
 
+        # GUVENLIK AGI: pozisyon acik ama borsada AKTIF bir stop emri yoksa
+        # (onceki bir hata, manuel mudahale, vs.) HEMEN yeniden koy - pozisyon
+        # asla korumasiz kalmasin.
+        try:
+            open_orders = exchange.fetch_open_orders(symbol)
+            has_stop_order = any(o.get("type", "").upper() in ("STOP_MARKET", "STOP") for o in open_orders)
+            if not has_stop_order:
+                stop_side = "sell" if direction == "LONG" else "buy"
+                exchange.create_order(
+                    symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
+                    params={"stopPrice": current_stop, "reduceOnly": True},
+                )
+                send_telegram_message(
+                    f"🛡️ [Donchian] {symbol}: AKTİF STOP EMRİ BULUNAMADI, güvenlik ağı devreye girdi — "
+                    f"stop {current_stop:.6f} seviyesinde yeniden koyuldu."
+                )
+        except Exception as e:
+            print(f"{symbol} (Donchian): stop emri kontrolu/yeniden koyma basarisiz ({e})")
+
         try:
             df = fetch_donchian_ohlcv_df(symbol, limit=DONCHIAN_TREND_EMA_PERIOD + 30)
             df = compute_donchian_indicators(df)
@@ -861,17 +880,28 @@ def update_donchian_trailing_stops():
 
         if new_stop != current_stop:
             try:
-                exchange.cancel_all_orders(symbol)
                 stop_side = "sell" if direction == "LONG" else "buy"
+                # ONCE yeni stop'u koy, ANCAK basarili olursa eskisini iptal et -
+                # boylece yeni emir basarisiz olursa pozisyon HICBIR ZAMAN
+                # korumasiz kalmaz (eskiden once iptal edilip sonra yeni emir
+                # denendigi icin, yeni emir hata verirse pozisyon acikta kaliyordu).
                 exchange.create_order(
                     symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
                     params={"stopPrice": new_stop, "reduceOnly": True},
                 )
+                # Yeni emir basariyla koyuldu - simdi ESKI stop emrini (varsa) iptal et.
+                try:
+                    open_orders = exchange.fetch_open_orders(symbol)
+                    for o in open_orders:
+                        if o.get("stopPrice") and float(o["stopPrice"]) == current_stop:
+                            exchange.cancel_order(o["id"], symbol)
+                except Exception as cancel_err:
+                    print(f"{symbol} (Donchian): eski stop emri temizlenemedi ({cancel_err}) - iki stop emri birlikte durabilir, sorun degil (ilk tetiklenen kapatir)")
                 r["stop_price"] = str(new_stop)
                 r["extreme_price"] = str(new_extreme)
                 print(f"{symbol} (Donchian): trailing stop güncellendi {current_stop:.6f} -> {new_stop:.6f}")
             except Exception as e:
-                print(f"{symbol} (Donchian): trailing stop güncellenemedi ({e}), eski stop korunuyor")
+                print(f"{symbol} (Donchian): trailing stop güncellenemedi ({e}), ESKİ STOP HALA AKTİF (korumasız kalmadı)")
 
         still_open.append(r)
 
@@ -1190,6 +1220,24 @@ def update_squeeze_trailing_stops():
             )
             continue
 
+        # GUVENLIK AGI: pozisyon acik ama borsada AKTIF bir stop emri yoksa,
+        # HEMEN yeniden koy - pozisyon asla korumasiz kalmasin.
+        try:
+            open_orders = exchange.fetch_open_orders(symbol)
+            has_stop_order = any(o.get("type", "").upper() in ("STOP_MARKET", "STOP") for o in open_orders)
+            if not has_stop_order:
+                stop_side = "sell" if direction == "LONG" else "buy"
+                exchange.create_order(
+                    symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
+                    params={"stopPrice": current_stop, "reduceOnly": True},
+                )
+                send_telegram_message(
+                    f"🛡️ [Sıkışma] {symbol}: AKTİF STOP EMRİ BULUNAMADI, güvenlik ağı devreye girdi — "
+                    f"stop {current_stop:.6f} seviyesinde yeniden koyuldu."
+                )
+        except Exception as e:
+            print(f"{symbol} (Sıkışma): stop emri kontrolu/yeniden koyma basarisiz ({e})")
+
         try:
             df = fetch_squeeze_ohlcv_df(symbol, limit=SQUEEZE_BBW_LOOKBACK + 30)
             df = compute_squeeze_indicators(df)
@@ -1216,16 +1264,24 @@ def update_squeeze_trailing_stops():
 
         if new_stop != current_stop:
             try:
-                exchange.cancel_all_orders(symbol)
                 stop_side = "sell" if direction == "LONG" else "buy"
+                # ONCE yeni stop'u koy, ANCAK basarili olursa eskisini iptal et -
+                # pozisyon hicbir zaman korumasiz kalmasin diye.
                 exchange.create_order(
                     symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
                     params={"stopPrice": new_stop, "reduceOnly": True},
                 )
+                try:
+                    open_orders = exchange.fetch_open_orders(symbol)
+                    for o in open_orders:
+                        if o.get("stopPrice") and float(o["stopPrice"]) == current_stop:
+                            exchange.cancel_order(o["id"], symbol)
+                except Exception as cancel_err:
+                    print(f"{symbol} (Sıkışma): eski stop emri temizlenemedi ({cancel_err}) - sorun degil")
                 r["stop_price"] = str(new_stop)
                 r["extreme_price"] = str(new_extreme)
             except Exception as e:
-                print(f"{symbol} (Sıkışma): trailing stop güncellenemedi ({e})")
+                print(f"{symbol} (Sıkışma): trailing stop güncellenemedi ({e}), ESKİ STOP HALA AKTİF (korumasız kalmadı)")
 
         still_open.append(r)
 
