@@ -192,9 +192,9 @@ MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "5"))
 # bunun yerine SADECE Donchian sinyali calisir - REVERSE_SIGNALS bu moddan
 # ETKILENMEZ (kullanici acikca "tersine degil, orijinal" dedi).
 DONCHIAN_MODE = os.environ.get("DONCHIAN_MODE", "false").lower() == "true"
-DONCHIAN_TIMEFRAME = "4h"
-DONCHIAN_PERIOD = 55
-DONCHIAN_TREND_EMA_PERIOD = 200
+DONCHIAN_TIMEFRAME = os.environ.get("DONCHIAN_TIMEFRAME", "15m")  # eskiden 4h - 15m'e cekince cok daha sik sinyal
+DONCHIAN_PERIOD = int(os.environ.get("DONCHIAN_PERIOD", "55"))
+DONCHIAN_TREND_EMA_PERIOD = int(os.environ.get("DONCHIAN_TREND_EMA_PERIOD_ENV", "200"))
 CHANDELIER_MULT = 3.0        # trailing stop mesafesi = ATR14(4h) * bu katsayi
 DONCHIAN_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "donchian_positions.csv")
 DONCHIAN_FIELDNAMES = ["symbol", "direction", "entry_price", "stop_price", "extreme_price", "entry_time"]
@@ -1420,7 +1420,9 @@ def run_forever():
             f"Strateji: Donchian({DONCHIAN_PERIOD}) kırılım + EMA{DONCHIAN_TREND_EMA_PERIOD} trend filtresi, "
             f"ATR×{CHANDELIER_MULT} chandelier trailing stop. TP YOK — kazananın büyümesine izin veriliyor.\n\n"
             "⚠️ Bu strateji, şu ana kadarki TÜM testlerde EN KÖTÜ çıkan sonuçtu (isabet %28.1, "
-            "ort. -%1.9/işlem) — kullanıcı isteğiyle tersine çevrilmeden, olduğu gibi canlıda deneniyor.\n\n"
+            "ort. -%1.9/işlem, 4h mumla test edilmişti) — kullanıcı isteğiyle tersine çevrilmeden, "
+            "olduğu gibi canlıda deneniyor. Daha sık sinyal için zaman dilimi 4h'den 15m'e kısaltıldı, "
+            "bu yüzden gerçek sonuç orijinal backtest'ten biraz farklı çıkabilir.\n\n"
             f"{mode_text}\n\n"
             f"💾 {len(recovered_donchian)} açık Donchian pozisyonu geri yüklendi (varsa)."
         )
