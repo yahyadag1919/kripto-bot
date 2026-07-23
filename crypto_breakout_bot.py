@@ -203,6 +203,26 @@ DONCHIAN_FIELDNAMES = ["symbol", "direction", "signal_direction", "entry_price",
 # Telegram bildirimi ise sinyalin ORIJINAL yonunu gostermeye devam ediyor
 # (yani LONG sinyali gelirse bildirim hala "LONG" yazar, ama borsada SHORT acilir).
 DONCHIAN_INVERT_EXECUTION = os.environ.get("DONCHIAN_INVERT_EXECUTION", "true").lower() == "true"
+# Kullanicinin istegiyle: stop'a takilirsa kaybedilecek DOLAR miktari dogrudan
+# bakiyenin bu yuzdesi olacak sekilde pozisyon boyutlandiriliyor (ATR mesafesi
+# ne olursa olsun sonuc hep ayni % kayip). Marjin tavani da buna gore genisletildi
+# (asiri dar ATR mesafesinde bile hedeflenen %10 riske ulasilabilsin diye).
+DONCHIAN_RISK_PER_TRADE_PCT = float(os.environ.get("DONCHIAN_RISK_PER_TRADE_PCT", "10"))
+DONCHIAN_POSITION_PCT_OF_BALANCE = float(os.environ.get("DONCHIAN_POSITION_PCT_OF_BALANCE", "20"))
+# Sinyal tespit edilince HEMEN islem acmak yerine, GERCEKTE acilacak yonde
+# (ters cevrilmis yonde) fiyatin birkac mum boyunca dogrulanmasini bekler.
+# Amac: sinyal LONG dese bile coin gercekten yukselmeye devam ediyorsa, bizim
+# SHORT'umuzun hemen zarara girmesini onlemek - once dogrulama, sonra giris.
+DONCHIAN_CONFIRMATION_CANDLES = int(os.environ.get("DONCHIAN_CONFIRMATION_CANDLES", "1"))
+DONCHIAN_MAX_WAIT_CANDLES = int(os.environ.get("DONCHIAN_MAX_WAIT_CANDLES", "5"))
+DONCHIAN_PENDING_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "donchian_pending_signals.csv")
+DONCHIAN_PENDING_FIELDNAMES = ["symbol", "signal_direction", "trade_direction", "reference_price", "atr14", "confirm_count", "candles_waited"]
+# Kullanicinin acikca istedigi gibi: %10 risk, o anki DEGISKEN bakiyeden degil,
+# hesaba YATIRILAN SABIT tutardan hesaplaniyor. Bu tutar bir dosyada saklanip
+# bot her yeniden baslatildiginda ayni kaliyor (Railway redeploy'da bile).
+# Railway'de DONCHIAN_REFERENCE_BALANCE env degiskeniyle elle de ayarlanabilir/
+# duzeltilebilir (orn. gercek yatirilan tutar farkliysa).
+DONCHIAN_REFERENCE_BALANCE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "donchian_reference_balance.txt")
 
 # --- Native TP (Take Profit) emri ---
 # Binance'e, checkpoint dongusunun beklemesine gerek kalmadan aninda tetiklenecek
@@ -636,6 +656,56 @@ def _write_donchian_positions(rows):
         writer.writerows(rows)
 
 
+def get_donchian_reference_balance() -> float:
+    """Hesaba YATIRILAN SABIT tutari dondurur - o anki degisken bakiye DEGIL.
+    Once Railway env degiskenini kontrol eder (elle ayarlanmis/duzeltilmis olabilir),
+    yoksa diskteki kayitli degeri okur, o da yoksa ILK KEZ o anki bakiyeyi baz alip
+    diske kaydeder (bundan sonra hep bu sabit deger kullanilir, redeploy'da bile degismez)."""
+    env_override = os.environ.get("DONCHIAN_REFERENCE_BALANCE")
+    if env_override:
+        return float(env_override)
+
+    if os.path.isfile(DONCHIAN_REFERENCE_BALANCE_FILE):
+        with open(DONCHIAN_REFERENCE_BALANCE_FILE) as f:
+            return float(f.read().strip())
+
+    balance = exchange.fetch_balance()
+    free_usdt = balance.get("USDT", {}).get("free", 0)
+    with open(DONCHIAN_REFERENCE_BALANCE_FILE, "w") as f:
+        f.write(str(free_usdt))
+    return free_usdt
+
+
+def _compute_donchian_position_size(symbol: str, entry_price: float, stop_price: float) -> float:
+    """_compute_position_size ile ayni mantik (sabit DOLAR riski / stop mesafesi),
+    ama Donchian moduna ozel: DONCHIAN_RISK_PER_TRADE_PCT (varsayilan %10) ve
+    DONCHIAN_POSITION_PCT_OF_BALANCE (varsayilan %20) kullanir - boylece stop'a
+    takilirsa kaybedilen TAM OLARAK bakiyenin %10'u olur (ATR mesafesinden bagimsiz).
+    Risk tutari, o anki DEGISKEN bakiyeden degil, YATIRILAN SABIT tutardan hesaplanir -
+    ama marjin tavani (asiri pozisyon acilmasin diye guvenlik siniri) hala o anki GERCEK
+    kullanilabilir bakiyeyi de goz onunde bulunduruyor (yetersiz marjin hatasi almamak icin)."""
+    reference_balance = get_donchian_reference_balance()
+
+    balance = exchange.fetch_balance()
+    free_usdt = balance.get("USDT", {}).get("free", 0)
+
+    stop_distance = abs(entry_price - stop_price)
+    if stop_distance <= 0:
+        return 0
+
+    risk_amount = reference_balance * (DONCHIAN_RISK_PER_TRADE_PCT / 100)
+    risk_based_qty = risk_amount / stop_distance
+
+    # marjin tavani: hem sabit referansa hem o anki gercek bakiyeye gore - hangisi
+    # daha kucukse o kullanilir, boylece bakiye referansin altina dusmusse bile
+    # gercekte olmayan bir marjini kullanmaya calisip hata almayiz
+    safe_balance_for_margin = min(reference_balance, free_usdt) if free_usdt > 0 else reference_balance
+    max_notional = safe_balance_for_margin * (DONCHIAN_POSITION_PCT_OF_BALANCE / 100) * LEVERAGE
+    max_qty_by_margin = max_notional / entry_price
+
+    return min(risk_based_qty, max_qty_by_margin)
+
+
 def open_donchian_position(symbol: str, signal_direction: str, entry_price: float, atr14: float):
     """SINYAL TESPITI (Donchian kirilim + trend filtresi) hic degismiyor - signal_direction
     parametresi dogrudan check_donchian_gate'in urettigi ORIJINAL yondur, DOKUNULMUYOR.
@@ -650,7 +720,7 @@ def open_donchian_position(symbol: str, signal_direction: str, entry_price: floa
 
     provisional_stop = (entry_price - atr14 * CHANDELIER_MULT if trade_direction == "LONG"
                          else entry_price + atr14 * CHANDELIER_MULT)
-    qty = _compute_position_size(symbol, entry_price, provisional_stop)
+    qty = _compute_donchian_position_size(symbol, entry_price, provisional_stop)
     if qty <= 0:
         raise ValueError("Hesaplanan pozisyon miktari sifir veya negatif.")
 
@@ -779,15 +849,86 @@ def update_donchian_trailing_stops():
     _write_donchian_positions(still_open)
 
 
+def _read_donchian_pending():
+    if not os.path.isfile(DONCHIAN_PENDING_STATE_FILE):
+        return []
+    with open(DONCHIAN_PENDING_STATE_FILE, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _write_donchian_pending(rows):
+    with open(DONCHIAN_PENDING_STATE_FILE, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=DONCHIAN_PENDING_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def process_donchian_pending_signals():
+    """Bekleyen (henuz acilmamis) sinyalleri kontrol eder: GERCEKTE acilacak yonde
+    (trade_direction) yeterli sayida mum kapanmissa (DONCHIAN_CONFIRMATION_CANDLES)
+    pozisyonu simdi acar. Cok uzun beklerse (DONCHIAN_MAX_WAIT_CANDLES) sinyali iptal eder."""
+    pending = _read_donchian_pending()
+    if not pending:
+        return
+    still_pending = []
+
+    for r in pending:
+        symbol = r["symbol"]
+        signal_direction = r["signal_direction"]
+        trade_direction = r["trade_direction"]
+        confirm_count = int(r["confirm_count"])
+        candles_waited = int(r["candles_waited"])
+        atr14 = float(r["atr14"])
+
+        try:
+            df = fetch_donchian_ohlcv_df(symbol, limit=30)
+        except Exception as e:
+            print(f"{symbol} (Donchian bekleyen sinyal): veri cekilemedi ({e}), bir sonraki tura birakildi")
+            still_pending.append(r)
+            continue
+
+        last_closed = df.iloc[-2]
+        candle_favors_trade = ((last_closed["close"] > last_closed["open"]) if trade_direction == "LONG"
+                                else (last_closed["close"] < last_closed["open"]))
+
+        candles_waited += 1
+        if candle_favors_trade:
+            confirm_count += 1
+        else:
+            confirm_count = 0  # ters mum gelirse dogrulama sifirlanir, baştan saymaya baslar
+
+        if confirm_count >= DONCHIAN_CONFIRMATION_CANDLES:
+            try:
+                open_donchian_position(symbol, signal_direction, last_closed["close"], atr14)
+            except Exception as e:
+                print(f"{symbol} (Donchian): dogrulanmis sinyal acilamadi ({e})")
+            continue  # acildi ya da hata verdi - her iki durumda da bekleme listesinden cikar
+
+        if candles_waited >= DONCHIAN_MAX_WAIT_CANDLES:
+            print(f"{symbol} (Donchian): {DONCHIAN_MAX_WAIT_CANDLES} mum icinde dogrulanamadi, sinyal iptal edildi")
+            continue  # listeden dusur, iptal
+
+        r["confirm_count"] = str(confirm_count)
+        r["candles_waited"] = str(candles_waited)
+        still_pending.append(r)
+
+    _write_donchian_pending(still_pending)
+
+
 def scan_donchian_once():
     """VWAP/Hacim Z-Skor'dan bagimsiz, ayri bir tarama: Donchian kirilim sinyali
-    arar, bulursa ORIJINAL yonde (tersine cevirmeden) pozisyon acar."""
+    arar. Bulursa HEMEN acmaz - GERCEKTE acilacak (ters cevrilmis) yonde fiyat
+    hareketinin dogrulanmasini beklemek uzere bekleme listesine ekler."""
     open_symbols = {r["symbol"] for r in _read_donchian_positions()}
+    pending_symbols = {r["symbol"] for r in _read_donchian_pending()}
     if len(open_symbols) >= MAX_OPEN_POSITIONS:
         return
 
+    pending_rows = _read_donchian_pending()
+    added = False
+
     for symbol in WATCHLIST:
-        if symbol in _unsupported_symbols or symbol in open_symbols:
+        if symbol in _unsupported_symbols or symbol in open_symbols or symbol in pending_symbols:
             continue
         try:
             df = fetch_donchian_ohlcv_df(symbol, limit=DONCHIAN_TREND_EMA_PERIOD + 30)
@@ -795,15 +936,31 @@ def scan_donchian_once():
             result = check_donchian_gate(df)
             if not result:
                 continue
-            direction, row = result
-            open_donchian_position(symbol, direction, row["close"], row["atr14"])
-            if len(_read_donchian_positions()) >= MAX_OPEN_POSITIONS:
+            signal_direction, row = result
+            trade_direction = (("SHORT" if signal_direction == "LONG" else "LONG")
+                                if DONCHIAN_INVERT_EXECUTION else signal_direction)
+
+            pending_rows.append({
+                "symbol": symbol, "signal_direction": signal_direction, "trade_direction": trade_direction,
+                "reference_price": str(row["close"]), "atr14": str(row["atr14"]),
+                "confirm_count": "0", "candles_waited": "0",
+            })
+            added = True
+            send_telegram_message(
+                f"🔎 [Donchian] {symbol} {signal_direction} sinyali tespit edildi — "
+                f"gerçek yönde ({DONCHIAN_CONFIRMATION_CANDLES} mum) doğrulama bekleniyor, "
+                f"henüz pozisyon açılmadı."
+            )
+            if len(open_symbols) + len(pending_rows) >= MAX_OPEN_POSITIONS:
                 break
         except Exception as e:
             if "does not have" in str(e).lower():
                 _unsupported_symbols.add(symbol)
             else:
                 print(f"{symbol} (Donchian) hata: {e}")
+
+    if added:
+        _write_donchian_pending(pending_rows)
 
 
 
@@ -1283,6 +1440,7 @@ def scan_once():
         # VWAP/Hacim Z-Skor sinyalleri bu modda DEVRE DISI - kullanicinin
         # istegiyle sadece Donchian trend-takip (orijinal yon) calisiyor.
         update_donchian_trailing_stops()
+        process_donchian_pending_signals()
         scan_donchian_once()
         return
 
@@ -1430,7 +1588,13 @@ def run_forever():
             "🐢 Kripto botu (DONCHIAN TREND-TAKİP - ORİJİNAL yön) başlatıldı.\n"
             f"{len(WATCHLIST)} coin taranıyor, {DONCHIAN_TIMEFRAME} mumla.\n\n"
             f"Strateji: Donchian({DONCHIAN_PERIOD}) kırılım + EMA{DONCHIAN_TREND_EMA_PERIOD} trend filtresi, "
-            f"ATR×{CHANDELIER_MULT} chandelier trailing stop. TP YOK — kazananın büyümesine izin veriliyor.\n\n"
+            f"ATR×{CHANDELIER_MULT} chandelier trailing stop (kâr büyüdükçe stop yukarı çekilir, asla gevşemez). "
+            f"TP YOK — kazananın büyümesine izin veriliyor.\n"
+            f"💰 Stop'a takılırsa kayıp = YATIRILAN SABİT bakiyenin %{DONCHIAN_RISK_PER_TRADE_PCT}'i "
+            f"(referans: {get_donchian_reference_balance():.2f} USDT — bu, o anki değişken bakiye değil, "
+            f"sabit bir referans; yanlışsa Railway'de DONCHIAN_REFERENCE_BALANCE env değişkeniyle düzelt).\n"
+            f"🔎 Sinyal gelince hemen açılmıyor — gerçek yönde {DONCHIAN_CONFIRMATION_CANDLES} mum "
+            f"doğrulama bekleniyor (en fazla {DONCHIAN_MAX_WAIT_CANDLES} mum, doğrulanmazsa iptal).\n\n"
             "⚠️ Bu strateji, şu ana kadarki TÜM testlerde EN KÖTÜ çıkan sonuçtu (isabet %28.1, "
             "ort. -%1.9/işlem, 4h mumla test edilmişti) — kullanıcı isteğiyle tersine çevrilmeden, "
             "olduğu gibi canlıda deneniyor. Daha sık sinyal için zaman dilimi 4h'den 15m'e kısaltıldı, "
