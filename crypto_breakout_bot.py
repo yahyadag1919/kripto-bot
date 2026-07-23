@@ -244,8 +244,14 @@ SQUEEZE_TRAIL_MULT = float(os.environ.get("SQUEEZE_TRAIL_MULT", "2.0"))  # trail
 SQUEEZE_RISK_PER_TRADE_PCT = float(os.environ.get("SQUEEZE_RISK_PER_TRADE_PCT", "10"))
 SQUEEZE_POSITION_PCT_OF_BALANCE = float(os.environ.get("SQUEEZE_POSITION_PCT_OF_BALANCE", "20"))
 SQUEEZE_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "squeeze_positions.csv")
-SQUEEZE_FIELDNAMES = ["symbol", "direction", "entry_price", "stop_price", "extreme_price", "entry_time"]
+SQUEEZE_FIELDNAMES = ["symbol", "direction", "signal_direction", "entry_price", "stop_price", "extreme_price", "entry_time"]
 SQUEEZE_REFERENCE_BALANCE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "squeeze_reference_balance.txt")
+# Kullanicinin Donchian'da istedigi ayni mantik: SINYAL TESPITI (sikisma+kirilim)
+# KESINLIKLE degismiyor. Sadece GERCEK ISLEM ters yonde aciliyor, Telegram
+# bildirimi sinyalin ORIJINAL yonunu gostermeye devam ediyor (coin zaten dipteyken
+# SHORT acilmasi gibi durumlari onlemek icin - kullanici XRPUSDT/ENJUSDT ornekleriyle
+# bunu acikca istedi).
+SQUEEZE_INVERT_EXECUTION = os.environ.get("SQUEEZE_INVERT_EXECUTION", "true").lower() == "true"
 
 # --- Native TP (Take Profit) emri ---
 # Binance'e, checkpoint dongusunun beklemesine gerek kalmadan aninda tetiklenecek
@@ -1090,11 +1096,18 @@ def _compute_squeeze_position_size(entry_price: float, stop_price: float) -> flo
     return min(risk_based_qty, max_qty_by_margin)
 
 
-def open_squeeze_position(symbol: str, direction: str, entry_price: float, atr14: float):
-    _set_leverage_safe(symbol)
-    side = "buy" if direction == "LONG" else "sell"
+def open_squeeze_position(symbol: str, signal_direction: str, entry_price: float, atr14: float):
+    """SINYAL TESPITI (sikisma+kirilim) hic degismiyor - signal_direction parametresi
+    check_squeeze_gate'in urettigi ORIJINAL yondur, DOKUNULMUYOR. Sadece GERCEK ISLEM,
+    SQUEEZE_INVERT_EXECUTION acikken TERS yonde aciliyor - Telegram bildirimi HER ZAMAN
+    sinyalin orijinal yonunu gosterir (Donchian modundakiyle AYNI mantik)."""
+    trade_direction = (("SHORT" if signal_direction == "LONG" else "LONG")
+                        if SQUEEZE_INVERT_EXECUTION else signal_direction)
 
-    provisional_stop = (entry_price - atr14 * SQUEEZE_ATR_STOP_MULT if direction == "LONG"
+    _set_leverage_safe(symbol)
+    side = "buy" if trade_direction == "LONG" else "sell"
+
+    provisional_stop = (entry_price - atr14 * SQUEEZE_ATR_STOP_MULT if trade_direction == "LONG"
                          else entry_price + atr14 * SQUEEZE_ATR_STOP_MULT)
     qty = _compute_squeeze_position_size(entry_price, provisional_stop)
     if qty <= 0:
@@ -1108,16 +1121,16 @@ def open_squeeze_position(symbol: str, direction: str, entry_price: float, atr14
         except Exception:
             real_entry_price = entry_price
 
-    stop_price = (real_entry_price - atr14 * SQUEEZE_ATR_STOP_MULT if direction == "LONG"
+    stop_price = (real_entry_price - atr14 * SQUEEZE_ATR_STOP_MULT if trade_direction == "LONG"
                   else real_entry_price + atr14 * SQUEEZE_ATR_STOP_MULT)
-    stop_side = "sell" if direction == "LONG" else "buy"
+    stop_side = "sell" if trade_direction == "LONG" else "buy"
     try:
         exchange.create_order(
             symbol, type="STOP_MARKET", side=stop_side, amount=qty,
             params={"stopPrice": stop_price, "reduceOnly": True},
         )
     except Exception as e:
-        close_err = _close_position(symbol, direction, qty)
+        close_err = _close_position(symbol, trade_direction, qty)
         send_telegram_message(
             f"⚠️ {symbol} (Sıkışma+Kırılım): koruyucu stop emri başarısız oldu ({e}) — "
             f"pozisyon {'kapatıldı' if not close_err else 'KAPATILAMADI, MANUEL KONTROL ET: ' + close_err}."
@@ -1126,14 +1139,14 @@ def open_squeeze_position(symbol: str, direction: str, entry_price: float, atr14
 
     rows = _read_squeeze_positions()
     rows.append({
-        "symbol": symbol, "direction": direction, "entry_price": real_entry_price,
-        "stop_price": stop_price, "extreme_price": real_entry_price,
+        "symbol": symbol, "direction": trade_direction, "signal_direction": signal_direction,
+        "entry_price": real_entry_price, "stop_price": stop_price, "extreme_price": real_entry_price,
         "entry_time": datetime.now().isoformat(),
     })
     _write_squeeze_positions(rows)
 
     send_telegram_message(
-        f"🗜️ [Sıkışma+Kırılım] {symbol} {direction} pozisyon açıldı (sıkışma sonrası güçlü kırılım).\n"
+        f"🗜️ [Sıkışma+Kırılım] {symbol} {signal_direction} pozisyon açıldı (sıkışma sonrası güçlü kırılım).\n"
         f"Giriş: {real_entry_price:.6f} | İlk stop: {stop_price:.6f} (ATR×{SQUEEZE_ATR_STOP_MULT})\n"
         f"TP YOK — trailing stop kazananın büyümesine izin veriyor."
     )
@@ -1148,7 +1161,8 @@ def update_squeeze_trailing_stops():
 
     for r in rows:
         symbol = r["symbol"]
-        direction = r["direction"]
+        direction = r["direction"]  # GERCEK islem yonu
+        signal_direction = r.get("signal_direction", direction)  # bildirimde gosterilecek
         entry_price = float(r["entry_price"])
         current_stop = float(r["stop_price"])
         extreme = float(r["extreme_price"])
@@ -1169,9 +1183,9 @@ def update_squeeze_trailing_stops():
             raw_pct = (current_price - entry_price) / entry_price * 100
             pct_change = raw_pct if direction == "LONG" else -raw_pct
             sonuc = "TP (trailing, sessiz)" if pct_change > 0 else "SL (trailing, sessiz)"
-            log_closed_trade(symbol, "Sıkışma+Kırılım", direction, entry_price, current_price, pct_change, sonuc)
+            log_closed_trade(symbol, "Sıkışma+Kırılım", signal_direction, entry_price, current_price, pct_change, sonuc)
             send_telegram_message(
-                f"🗜️ [Sıkışma+Kırılım] {symbol} {direction} pozisyon kapanmış (trailing stop'a takılmış). "
+                f"🗜️ [Sıkışma+Kırılım] {symbol} {signal_direction} pozisyon kapanmış (trailing stop'a takılmış). "
                 f"Giriş: {entry_price:.6f} | Şimdi: {current_price:.6f} | Değişim: {pct_change:+.2f}%"
             )
             continue
@@ -1877,8 +1891,10 @@ def run_forever():
             f"Strateji: Bollinger Band genişliği son {SQUEEZE_BBW_LOOKBACK} mumun en dar "
             f"%{int(SQUEEZE_PERCENTILE*100)}'ine düşünce SIKIŞMA sayılır; ardından güçlü bir mum "
             f"(gövde ort.×{SQUEEZE_STRONG_BODY_MULT}) son {SQUEEZE_WINDOW} mumun en yüksek/en düşüğünü "
-            f"kırınca o yönde giriş (kullanıcının grafikte gözlemlediği örüntü, test edilmeden canlıda deneniyor).\n"
-            f"ATR×{SQUEEZE_TRAIL_MULT} chandelier trailing stop, TP YOK.\n"
+            f"kırınca sinyal (kullanıcının grafikte gözlemlediği örüntü).\n"
+            + (f"🔄 YÖN TERSİNE ÇEVRİLDİ: bildirim sinyal yönünü gösterir ama gerçek işlem TERSİ yönde açılır "
+               f"(ör. LONG bildirimi gelir, gerçekte SHORT açılır).\n" if SQUEEZE_INVERT_EXECUTION else "")
+            + f"ATR×{SQUEEZE_TRAIL_MULT} chandelier trailing stop, TP YOK.\n"
             f"💰 Stop'a takılırsa kayıp = YATIRILAN SABİT bakiyenin %{SQUEEZE_RISK_PER_TRADE_PCT}'i "
             f"(referans: {get_squeeze_reference_balance():.2f} USDT, SQUEEZE_REFERENCE_BALANCE ile düzeltilebilir).\n\n"
             f"{mode_text}\n\n"
