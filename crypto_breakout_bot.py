@@ -224,6 +224,29 @@ DONCHIAN_PENDING_FIELDNAMES = ["symbol", "signal_direction", "trade_direction", 
 # duzeltilebilir (orn. gercek yatirilan tutar farkliysa).
 DONCHIAN_REFERENCE_BALANCE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "donchian_reference_balance.txt")
 
+# --- SIKISMA + KIRILIM MODU (SQUEEZE_MODE) ---
+# Kullanicinin bir grafikte gozlemledigi oruntu: fiyat bir sure DAR bir bantta
+# sikisiyor (hareketli ortalamalar birbirine yaklasiyor, dusuk oynaklik), sonra
+# GUCLU bir mumla o bandi kirip sert bir yone gidiyor. Test EDILMEDEN, dogrudan
+# canlida denenmesi istendi. SQUEEZE_MODE etkinlestirilince DONCHIAN_MODE'un
+# ONUNE gecer (ikisi ayni anda calismaz, karisikligi onlemek icin).
+SQUEEZE_MODE = os.environ.get("SQUEEZE_MODE", "false").lower() == "true"
+SQUEEZE_TIMEFRAME = os.environ.get("SQUEEZE_TIMEFRAME", "15m")
+SQUEEZE_BB_PERIOD = int(os.environ.get("SQUEEZE_BB_PERIOD", "20"))
+SQUEEZE_BB_STD = float(os.environ.get("SQUEEZE_BB_STD", "2.0"))
+SQUEEZE_BBW_LOOKBACK = int(os.environ.get("SQUEEZE_BBW_LOOKBACK", "100"))  # sikisma esigi bu kadar mum gerive bakarak belirlenir
+SQUEEZE_PERCENTILE = float(os.environ.get("SQUEEZE_PERCENTILE", "0.20"))  # BBW bu yuzdelik dilimin altindaysa "sikisma"
+SQUEEZE_WINDOW = int(os.environ.get("SQUEEZE_WINDOW", "20"))  # kirilim seviyesi bu kadar mumun en yuksek/dusugu
+SQUEEZE_STRONG_BODY_MULT = float(os.environ.get("SQUEEZE_STRONG_BODY_MULT", "1.5"))
+SQUEEZE_BODY_AVG_WINDOW = int(os.environ.get("SQUEEZE_BODY_AVG_WINDOW", "20"))
+SQUEEZE_ATR_STOP_MULT = float(os.environ.get("SQUEEZE_ATR_STOP_MULT", "2.0"))  # ilk stop mesafesi = ATR14 * bu katsayi
+SQUEEZE_TRAIL_MULT = float(os.environ.get("SQUEEZE_TRAIL_MULT", "2.0"))  # trailing stop mesafesi de ATR14 * bu katsayi
+SQUEEZE_RISK_PER_TRADE_PCT = float(os.environ.get("SQUEEZE_RISK_PER_TRADE_PCT", "10"))
+SQUEEZE_POSITION_PCT_OF_BALANCE = float(os.environ.get("SQUEEZE_POSITION_PCT_OF_BALANCE", "20"))
+SQUEEZE_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "squeeze_positions.csv")
+SQUEEZE_FIELDNAMES = ["symbol", "direction", "entry_price", "stop_price", "extreme_price", "entry_time"]
+SQUEEZE_REFERENCE_BALANCE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "squeeze_reference_balance.txt")
+
 # --- Native TP (Take Profit) emri ---
 # Binance'e, checkpoint dongusunun beklemesine gerek kalmadan aninda tetiklenecek
 # bir TP emri de birakiyoruz (en yakin checkpoint hedefinde, 1sa/%0.3). Ama ciplak
@@ -963,6 +986,263 @@ def scan_donchian_once():
         _write_donchian_pending(pending_rows)
 
 
+# ---------------------------------------------------------------------------
+# SIKISMA + KIRILIM MODU - Donchian'a benzer sekilde ayri, kendi kendine
+# yeten bir alt-sistem. Test edilmeden dogrudan canlida denenmesi istendi.
+# ---------------------------------------------------------------------------
+
+def get_squeeze_reference_balance() -> float:
+    env_override = os.environ.get("SQUEEZE_REFERENCE_BALANCE")
+    if env_override:
+        return float(env_override)
+    if os.path.isfile(SQUEEZE_REFERENCE_BALANCE_FILE):
+        with open(SQUEEZE_REFERENCE_BALANCE_FILE) as f:
+            return float(f.read().strip())
+    balance = exchange.fetch_balance()
+    free_usdt = balance.get("USDT", {}).get("free", 0)
+    with open(SQUEEZE_REFERENCE_BALANCE_FILE, "w") as f:
+        f.write(str(free_usdt))
+    return free_usdt
+
+
+def fetch_squeeze_ohlcv_df(symbol: str, limit: int = 200) -> pd.DataFrame:
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=SQUEEZE_TIMEFRAME, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    return df
+
+
+def compute_squeeze_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    mid = df["close"].rolling(SQUEEZE_BB_PERIOD).mean()
+    std = df["close"].rolling(SQUEEZE_BB_PERIOD).std()
+    upper = mid + SQUEEZE_BB_STD * std
+    lower = mid - SQUEEZE_BB_STD * std
+    df["bbw"] = (upper - lower) / mid
+    df["squeeze_threshold"] = df["bbw"].rolling(SQUEEZE_BBW_LOOKBACK).quantile(SQUEEZE_PERCENTILE)
+    df["in_squeeze"] = df["bbw"] <= df["squeeze_threshold"]
+    df["squeeze_high"] = df["high"].shift(1).rolling(SQUEEZE_WINDOW).max()
+    df["squeeze_low"] = df["low"].shift(1).rolling(SQUEEZE_WINDOW).min()
+    df["body"] = (df["close"] - df["open"]).abs()
+    df["avg_body20"] = df["body"].rolling(SQUEEZE_BODY_AVG_WINDOW).mean()
+
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close = (df["low"] - df["close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df["atr14"] = tr.rolling(ATR_PERIOD).mean()
+    return df
+
+
+def check_squeeze_gate(df: pd.DataFrame):
+    """Bir onceki mum SIKISMADAYDI, simdiki mum GUCLU govdeyle sikisma araligini
+    kiriyorsa -> kirilim yonunde sinyal (dogrudan bu yonde islem acilir, TERS
+    CEVRILMEZ - kullanicinin gozlemledigi orneğe uygun)."""
+    if len(df) < max(SQUEEZE_BBW_LOOKBACK, SQUEEZE_WINDOW, SQUEEZE_BODY_AVG_WINDOW) + 3:
+        return None
+    prev = df.iloc[-3]
+    row = df.iloc[-2]
+    if pd.isna(prev.get("in_squeeze")) or pd.isna(row.get("squeeze_high")) or pd.isna(row.get("avg_body20")) or pd.isna(row.get("atr14")) or row["avg_body20"] == 0:
+        return None
+    if not prev["in_squeeze"]:
+        return None
+    strong_body = row["body"] >= row["avg_body20"] * SQUEEZE_STRONG_BODY_MULT
+    if not strong_body:
+        return None
+    if row["close"] > row["squeeze_high"]:
+        return "LONG", row
+    elif row["close"] < row["squeeze_low"]:
+        return "SHORT", row
+    return None
+
+
+def _read_squeeze_positions():
+    if not os.path.isfile(SQUEEZE_STATE_FILE):
+        return []
+    with open(SQUEEZE_STATE_FILE, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _write_squeeze_positions(rows):
+    with open(SQUEEZE_STATE_FILE, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=SQUEEZE_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _compute_squeeze_position_size(entry_price: float, stop_price: float) -> float:
+    """Donchian'daki bakiye-bazli mantigin ayni - stop'a takilirsa kaybedilen
+    TAM OLARAK referans bakiyenin SQUEEZE_RISK_PER_TRADE_PCT'i olur."""
+    reference_balance = get_squeeze_reference_balance()
+    balance = exchange.fetch_balance()
+    free_usdt = balance.get("USDT", {}).get("free", 0)
+
+    stop_distance = abs(entry_price - stop_price)
+    if stop_distance <= 0:
+        return 0
+
+    risk_amount = reference_balance * (SQUEEZE_RISK_PER_TRADE_PCT / 100)
+    risk_based_qty = risk_amount / stop_distance
+
+    max_notional = min(reference_balance, free_usdt) * (SQUEEZE_POSITION_PCT_OF_BALANCE / 100) * LEVERAGE
+    max_qty_by_margin = max_notional / entry_price
+
+    return min(risk_based_qty, max_qty_by_margin)
+
+
+def open_squeeze_position(symbol: str, direction: str, entry_price: float, atr14: float):
+    _set_leverage_safe(symbol)
+    side = "buy" if direction == "LONG" else "sell"
+
+    provisional_stop = (entry_price - atr14 * SQUEEZE_ATR_STOP_MULT if direction == "LONG"
+                         else entry_price + atr14 * SQUEEZE_ATR_STOP_MULT)
+    qty = _compute_squeeze_position_size(entry_price, provisional_stop)
+    if qty <= 0:
+        raise ValueError("Hesaplanan pozisyon miktari sifir veya negatif.")
+
+    order = exchange.create_order(symbol, type="market", side=side, amount=qty)
+    real_entry_price = order.get("average") or order.get("price")
+    if not real_entry_price:
+        try:
+            real_entry_price = exchange.fetch_ticker(symbol)["last"]
+        except Exception:
+            real_entry_price = entry_price
+
+    stop_price = (real_entry_price - atr14 * SQUEEZE_ATR_STOP_MULT if direction == "LONG"
+                  else real_entry_price + atr14 * SQUEEZE_ATR_STOP_MULT)
+    stop_side = "sell" if direction == "LONG" else "buy"
+    try:
+        exchange.create_order(
+            symbol, type="STOP_MARKET", side=stop_side, amount=qty,
+            params={"stopPrice": stop_price, "reduceOnly": True},
+        )
+    except Exception as e:
+        close_err = _close_position(symbol, direction, qty)
+        send_telegram_message(
+            f"⚠️ {symbol} (Sıkışma+Kırılım): koruyucu stop emri başarısız oldu ({e}) — "
+            f"pozisyon {'kapatıldı' if not close_err else 'KAPATILAMADI, MANUEL KONTROL ET: ' + close_err}."
+        )
+        return None
+
+    rows = _read_squeeze_positions()
+    rows.append({
+        "symbol": symbol, "direction": direction, "entry_price": real_entry_price,
+        "stop_price": stop_price, "extreme_price": real_entry_price,
+        "entry_time": datetime.now().isoformat(),
+    })
+    _write_squeeze_positions(rows)
+
+    send_telegram_message(
+        f"🗜️ [Sıkışma+Kırılım] {symbol} {direction} pozisyon açıldı (sıkışma sonrası güçlü kırılım).\n"
+        f"Giriş: {real_entry_price:.6f} | İlk stop: {stop_price:.6f} (ATR×{SQUEEZE_ATR_STOP_MULT})\n"
+        f"TP YOK — trailing stop kazananın büyümesine izin veriyor."
+    )
+    return qty
+
+
+def update_squeeze_trailing_stops():
+    rows = _read_squeeze_positions()
+    if not rows:
+        return
+    still_open = []
+
+    for r in rows:
+        symbol = r["symbol"]
+        direction = r["direction"]
+        entry_price = float(r["entry_price"])
+        current_stop = float(r["stop_price"])
+        extreme = float(r["extreme_price"])
+
+        try:
+            positions = exchange.fetch_positions([symbol])
+            live_qty = sum(abs(float(p.get("contracts") or 0)) for p in positions if p.get("symbol") == symbol)
+        except Exception as e:
+            print(f"{symbol} (Sıkışma): pozisyon sorgulanamadi ({e})")
+            still_open.append(r)
+            continue
+
+        if live_qty <= 0:
+            try:
+                current_price = exchange.fetch_ticker(symbol)["last"]
+            except Exception:
+                current_price = current_stop
+            raw_pct = (current_price - entry_price) / entry_price * 100
+            pct_change = raw_pct if direction == "LONG" else -raw_pct
+            sonuc = "TP (trailing, sessiz)" if pct_change > 0 else "SL (trailing, sessiz)"
+            log_closed_trade(symbol, "Sıkışma+Kırılım", direction, entry_price, current_price, pct_change, sonuc)
+            send_telegram_message(
+                f"🗜️ [Sıkışma+Kırılım] {symbol} {direction} pozisyon kapanmış (trailing stop'a takılmış). "
+                f"Giriş: {entry_price:.6f} | Şimdi: {current_price:.6f} | Değişim: {pct_change:+.2f}%"
+            )
+            continue
+
+        try:
+            df = fetch_squeeze_ohlcv_df(symbol, limit=SQUEEZE_BBW_LOOKBACK + 30)
+            df = compute_squeeze_indicators(df)
+            last_row = df.iloc[-2]
+            latest_close = last_row["close"]
+            latest_atr = last_row["atr14"]
+        except Exception as e:
+            print(f"{symbol} (Sıkışma): veri cekilemedi ({e})")
+            still_open.append(r)
+            continue
+
+        if pd.isna(latest_atr):
+            still_open.append(r)
+            continue
+
+        if direction == "LONG":
+            new_extreme = max(extreme, latest_close)
+            candidate_stop = new_extreme - latest_atr * SQUEEZE_TRAIL_MULT
+            new_stop = max(current_stop, candidate_stop)
+        else:
+            new_extreme = min(extreme, latest_close)
+            candidate_stop = new_extreme + latest_atr * SQUEEZE_TRAIL_MULT
+            new_stop = min(current_stop, candidate_stop)
+
+        if new_stop != current_stop:
+            try:
+                exchange.cancel_all_orders(symbol)
+                stop_side = "sell" if direction == "LONG" else "buy"
+                exchange.create_order(
+                    symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
+                    params={"stopPrice": new_stop, "reduceOnly": True},
+                )
+                r["stop_price"] = str(new_stop)
+                r["extreme_price"] = str(new_extreme)
+            except Exception as e:
+                print(f"{symbol} (Sıkışma): trailing stop güncellenemedi ({e})")
+
+        still_open.append(r)
+
+    _write_squeeze_positions(still_open)
+
+
+def scan_squeeze_once():
+    open_symbols = {r["symbol"] for r in _read_squeeze_positions()}
+    if len(open_symbols) >= MAX_OPEN_POSITIONS:
+        return
+
+    for symbol in WATCHLIST:
+        if symbol in _unsupported_symbols or symbol in open_symbols:
+            continue
+        try:
+            df = fetch_squeeze_ohlcv_df(symbol, limit=SQUEEZE_BBW_LOOKBACK + 30)
+            df = compute_squeeze_indicators(df)
+            result = check_squeeze_gate(df)
+            if not result:
+                continue
+            direction, row = result
+            open_squeeze_position(symbol, direction, row["close"], row["atr14"])
+            if len(_read_squeeze_positions()) >= MAX_OPEN_POSITIONS:
+                break
+        except Exception as e:
+            if "does not have" in str(e).lower():
+                _unsupported_symbols.add(symbol)
+            else:
+                print(f"{symbol} (Sıkışma) hata: {e}")
+
+
 
     try:
         ob = exchange.fetch_order_book(symbol, limit=20)
@@ -1436,6 +1716,13 @@ def _emit_signal(symbol: str, strategy: str, strategy_desc: str, direction: str,
 def scan_once():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Tarama basliyor...")
 
+    if SQUEEZE_MODE:
+        # Sikisma+Kirilim modu digerlerinin (VWAP/Hacim/Donchian) ONUNE gecer -
+        # test edilmeden dogrudan canlida denenmesi istendi.
+        update_squeeze_trailing_stops()
+        scan_squeeze_once()
+        return
+
     if DONCHIAN_MODE:
         # VWAP/Hacim Z-Skor sinyalleri bu modda DEVRE DISI - kullanicinin
         # istegiyle sadece Donchian trend-takip (orijinal yon) calisiyor.
@@ -1582,7 +1869,22 @@ def run_forever():
              "pozisyon takibi bir sonraki deploy'da/restart'ta silinecek."
     )
 
-    if DONCHIAN_MODE:
+    if SQUEEZE_MODE:
+        recovered_squeeze = _read_squeeze_positions()
+        send_telegram_message(
+            "🗜️ Kripto botu (SIKIŞMA + KIRILIM) başlatıldı.\n"
+            f"{len(WATCHLIST)} coin taranıyor, {SQUEEZE_TIMEFRAME} mumla.\n\n"
+            f"Strateji: Bollinger Band genişliği son {SQUEEZE_BBW_LOOKBACK} mumun en dar "
+            f"%{int(SQUEEZE_PERCENTILE*100)}'ine düşünce SIKIŞMA sayılır; ardından güçlü bir mum "
+            f"(gövde ort.×{SQUEEZE_STRONG_BODY_MULT}) son {SQUEEZE_WINDOW} mumun en yüksek/en düşüğünü "
+            f"kırınca o yönde giriş (kullanıcının grafikte gözlemlediği örüntü, test edilmeden canlıda deneniyor).\n"
+            f"ATR×{SQUEEZE_TRAIL_MULT} chandelier trailing stop, TP YOK.\n"
+            f"💰 Stop'a takılırsa kayıp = YATIRILAN SABİT bakiyenin %{SQUEEZE_RISK_PER_TRADE_PCT}'i "
+            f"(referans: {get_squeeze_reference_balance():.2f} USDT, SQUEEZE_REFERENCE_BALANCE ile düzeltilebilir).\n\n"
+            f"{mode_text}\n\n"
+            f"💾 {len(recovered_squeeze)} açık Sıkışma pozisyonu geri yüklendi (varsa)."
+        )
+    elif DONCHIAN_MODE:
         recovered_donchian = _read_donchian_positions()
         send_telegram_message(
             "🐢 Kripto botu (DONCHIAN TREND-TAKİP - ORİJİNAL yön) başlatıldı.\n"
