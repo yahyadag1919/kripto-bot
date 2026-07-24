@@ -104,6 +104,12 @@ exchange = ccxt.binanceusdm({
     "secret": os.environ.get("BINANCE_API_SECRET"),
     "enableRateLimit": True,
 })
+# fetch_open_orders() sembolsuz cagrilinca (hesap capinda tum emirleri
+# cekmek icin, cleanup_orphaned_orders'ta kullaniliyor) ccxt bir uyari
+# firlatiyor ve bu, cagriyi BASARISIZ gibi gorunduruyordu (except bloguna
+# dusup fonksiyon hic calismadan cikiyordu). Bu satir uyariyi kabul edip
+# gercek veriyi almasini sagliyor.
+exchange.options["warnWithoutSymbol"] = False
 
 # TESTNET=true iken sahte parayla Binance'in test ortaminda calisir - gercek
 # paraya gecmeden once BUNUNLA test et. Railway'de TESTNET degiskenini "false"
