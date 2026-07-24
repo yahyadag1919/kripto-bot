@@ -105,11 +105,15 @@ exchange = ccxt.binanceusdm({
     "enableRateLimit": True,
 })
 # fetch_open_orders() sembolsuz cagrilinca (hesap capinda tum emirleri
+# fetch_open_orders() sembolsuz cagrilinca (hesap capinda tum emirleri
 # cekmek icin, cleanup_orphaned_orders'ta kullaniliyor) ccxt bir uyari
-# firlatiyor ve bu, cagriyi BASARISIZ gibi gorunduruyordu (except bloguna
-# dusup fonksiyon hic calismadan cikiyordu). Bu satir uyariyi kabul edip
-# gercek veriyi almasini sagliyor.
-exchange.options["warnWithoutSymbol"] = False
+# firlatiyor ve bu, cagriyi BASARISIZ gibi gorunduruyordu. ccxt surumune gore
+# bu ayarin anahtari degisebiliyor (bazi surumlerde duz, bazilarinda ic ice) -
+# ikisini birden ayarlayip garantiye aliyoruz. YINE DE calismazsa,
+# cleanup_orphaned_orders fonksiyonunda sembol-sembol sorgulama YEDEK
+# PLAN olarak devrede (bu uyariyi hicbir zaman vermiyor).
+exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
+exchange.options.setdefault("fetchOpenOrders", {})["warnWithoutSymbol"] = False
 
 # TESTNET=true iken sahte parayla Binance'in test ortaminda calisir - gercek
 # paraya gecmeden once BUNUNLA test et. Railway'de TESTNET degiskenini "false"
@@ -1882,8 +1886,20 @@ def cleanup_orphaned_orders():
     try:
         all_open_orders = exchange.fetch_open_orders()
     except Exception as e:
-        print(f"Basibos emir taramasi basarisiz (tum emirler cekilemedi): {e}")
-        return
+        print(f"Basibos emir taramasi (hesap capinda) basarisiz ({e}) - sembol sembol yedek plana geciliyor...")
+        # YEDEK PLAN: hesap capinda tek cagri calismazsa, WATCHLIST'teki her
+        # sembolu TEK TEK sorgula (bu sekilde cagirmak asla o uyariyi
+        # vermiyor, garantili calisir - ama daha yavas, o yuzden sadece
+        # ana yontem basarisiz olunca devreye giriyor).
+        all_open_orders = []
+        for sym in WATCHLIST:
+            if sym in tracked_symbols:
+                continue
+            try:
+                sym_orders = exchange.fetch_open_orders(sym)
+                all_open_orders.extend(sym_orders)
+            except Exception:
+                pass
 
     orphan_symbols = {}
     for o in all_open_orders:
