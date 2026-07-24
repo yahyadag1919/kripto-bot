@@ -881,22 +881,26 @@ def update_donchian_trailing_stops():
         if new_stop != current_stop:
             try:
                 stop_side = "sell" if direction == "LONG" else "buy"
-                # ONCE yeni stop'u koy, ANCAK basarili olursa eskisini iptal et -
-                # boylece yeni emir basarisiz olursa pozisyon HICBIR ZAMAN
-                # korumasiz kalmaz (eskiden once iptal edilip sonra yeni emir
-                # denendigi icin, yeni emir hata verirse pozisyon acikta kaliyordu).
+                # ONCE mevcut emirlerin ID'lerini not al (fiyat karsilastirmasi
+                # YAPMIYORUZ artik - float hassasiyeti yuzunden eslesme
+                # basarisiz olup emirlerin birikmesine, sonunda Binance'in
+                # "max stop order limit" hatasina yol acmisti).
+                try:
+                    old_order_ids = [o["id"] for o in exchange.fetch_open_orders(symbol)]
+                except Exception:
+                    old_order_ids = []
+
                 exchange.create_order(
                     symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
                     params={"stopPrice": new_stop, "reduceOnly": True},
                 )
-                # Yeni emir basariyla koyuldu - simdi ESKI stop emrini (varsa) iptal et.
-                try:
-                    open_orders = exchange.fetch_open_orders(symbol)
-                    for o in open_orders:
-                        if o.get("stopPrice") and float(o["stopPrice"]) == current_stop:
-                            exchange.cancel_order(o["id"], symbol)
-                except Exception as cancel_err:
-                    print(f"{symbol} (Donchian): eski stop emri temizlenemedi ({cancel_err}) - iki stop emri birlikte durabilir, sorun degil (ilk tetiklenen kapatir)")
+                # Yeni emir basariyla koyuldu - simdi ONCEDEN NOT ALINAN ESKI
+                # emirleri (ID'ye gore, fiyata gore DEGIL) iptal et.
+                for old_id in old_order_ids:
+                    try:
+                        exchange.cancel_order(old_id, symbol)
+                    except Exception as cancel_err:
+                        print(f"{symbol} (Donchian): eski emir {old_id} iptal edilemedi ({cancel_err})")
                 r["stop_price"] = str(new_stop)
                 r["extreme_price"] = str(new_extreme)
                 print(f"{symbol} (Donchian): trailing stop güncellendi {current_stop:.6f} -> {new_stop:.6f}")
@@ -1265,19 +1269,20 @@ def update_squeeze_trailing_stops():
         if new_stop != current_stop:
             try:
                 stop_side = "sell" if direction == "LONG" else "buy"
-                # ONCE yeni stop'u koy, ANCAK basarili olursa eskisini iptal et -
-                # pozisyon hicbir zaman korumasiz kalmasin diye.
+                try:
+                    old_order_ids = [o["id"] for o in exchange.fetch_open_orders(symbol)]
+                except Exception:
+                    old_order_ids = []
+
                 exchange.create_order(
                     symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
                     params={"stopPrice": new_stop, "reduceOnly": True},
                 )
-                try:
-                    open_orders = exchange.fetch_open_orders(symbol)
-                    for o in open_orders:
-                        if o.get("stopPrice") and float(o["stopPrice"]) == current_stop:
-                            exchange.cancel_order(o["id"], symbol)
-                except Exception as cancel_err:
-                    print(f"{symbol} (Sıkışma): eski stop emri temizlenemedi ({cancel_err}) - sorun degil")
+                for old_id in old_order_ids:
+                    try:
+                        exchange.cancel_order(old_id, symbol)
+                    except Exception as cancel_err:
+                        print(f"{symbol} (Sıkışma): eski emir {old_id} iptal edilemedi ({cancel_err})")
                 r["stop_price"] = str(new_stop)
                 r["extreme_price"] = str(new_extreme)
             except Exception as e:
@@ -1912,7 +1917,46 @@ def scan_once():
         )
 
 
+def cleanup_duplicate_stop_orders():
+    """Onceki bir hatadan (float fiyat esleme basarisiz oldugu icin eski stop
+    emirleri iptal edilemeyip birikmisti) kalma FAZLADAN emirleri temizler.
+    Her acik Donchian/Sikisma pozisyonu icin: birden fazla emir varsa,
+    EN SON konulani birakip digerlerini iptal eder."""
+    open_symbols = set()
+    for r in _read_donchian_positions():
+        open_symbols.add(r["symbol"])
+    for r in _read_squeeze_positions():
+        open_symbols.add(r["symbol"])
+
+    for symbol in open_symbols:
+        try:
+            open_orders = exchange.fetch_open_orders(symbol)
+            if len(open_orders) <= 1:
+                continue
+            # id'ler genelde artan sirada olusuyor - en buyugu (en yeni) haric hepsini iptal et
+            open_orders_sorted = sorted(open_orders, key=lambda o: o.get("timestamp") or 0)
+            to_cancel = open_orders_sorted[:-1]
+            for o in to_cancel:
+                try:
+                    exchange.cancel_order(o["id"], symbol)
+                except Exception as e:
+                    print(f"{symbol}: fazladan emir {o['id']} iptal edilemedi ({e})")
+            if to_cancel:
+                print(f"{symbol}: {len(to_cancel)} fazladan/eski emir temizlendi")
+        except Exception as e:
+            print(f"{symbol}: emir temizligi basarisiz ({e})")
+
+
 def run_forever():
+    if DONCHIAN_MODE or SQUEEZE_MODE:
+        # Onceki bir hatadan kalma birikmis fazladan stop emirlerini temizle -
+        # bu emirler Binance'in "max stop order limit" hatasina sebep olup
+        # pozisyonlarin zorla kapanmasina yol acmisti.
+        try:
+            cleanup_duplicate_stop_orders()
+        except Exception as e:
+            print(f"Baslangic emir temizligi basarisiz ({e})")
+
     checkpoint_text = " / ".join(f"{label}(%{target})" for _, target, label in CHECKPOINTS)
     if FULL_AUTO_TRADING:
         mode_text = (
