@@ -128,6 +128,15 @@ def _redirect_all_urls_to_demo(urls_node):
     hepsini tek tek elle yazmak yerine, iceride gecen 'fapi.binance.com' adresini
     (nerede gecerse gecsin, ic ice sozluk/liste farketmeksizin) 'demo-fapi.binance.com'
     ile degistiriyoruz. Boylece ccxt surumu/ic yapisi degisse bile calismaya devam eder.
+
+    NOT: eskiden ayri bir "klasik Testnet" (testnet.binancefuture.com) oldugunu
+    dusunup oraya gecmeyi denedik, ama arastirinca goruldu ki Binance bu adresi
+    ARTIK Demo Trading ile birlestirmis - resmi API dokumantasyonuna gore
+    testnet icin GERCEK/GUNCEL adres zaten demo-fapi.binance.com'un kendisi.
+    Yani burasi zaten doğru yerdi - sorun ortam degil, bu ortamin
+    fetch_open_orders() davranisinin guvenilmez olmasi (bkz. asagidaki
+    yazilim-tarafli stop mantigi, bu yuzden artik borsaya HIC stop emri
+    koymuyoruz).
     """
     if isinstance(urls_node, dict):
         return {k: _redirect_all_urls_to_demo(v) for k, v in urls_node.items()}
@@ -143,13 +152,14 @@ def _redirect_all_urls_to_demo(urls_node):
 if USE_TESTNET:
     # NOT: ccxt, binanceusdm icin set_sandbox_mode()'u ARTIK DESTEKLEMIYOR (deprecated,
     # bkz. https://t.me/ccxt_announcements/92) - o cagriyi kullanmiyoruz. Bunun yerine
-    # Binance'in yeni "Demo Trading" sistemine (demo.binance.com uzerinden olusturulan
-    # key'ler) ait demo-fapi adresine TUM ic uc-noktalari (fapiPublic, fapiPrivate,
-    # fapiPrivateV2/V3, fapiData vs.) kapsayacak sekilde yonlendiriyoruz.
+    # Binance'in resmi testnet/demo-fapi adresine TUM ic uc-noktalarini
+    # (fapiPublic, fapiPrivate, fapiPrivateV2/V3, fapiData vs.) kapsayacak
+    # sekilde yonlendiriyoruz. BINANCE_API_KEY/SECRET, demo.binance.com
+    # uzerinden alinmis Demo Trading anahtarlari olmali.
     try:
         exchange.urls["api"] = _redirect_all_urls_to_demo(exchange.urls["api"])
     except Exception as e:
-        print(f"Demo-fapi URL override uygulanamadi (ccxt surumu farkli olabilir): {e}")
+        print(f"Testnet URL override uygulanamadi (ccxt surumu farkli olabilir): {e}")
     # ccxt, API key varsa piyasalari yuklerken ekstra bir "para birimi detaylari"
     # cagrisi yapip gercek (canli) spot sunucusuna (api.binance.com/sapi/...) gidebiliyor -
     # bu cagri futures islemleri icin gereksiz, demo key'le orada hata veriyordu. Kapatiyoruz.
@@ -789,19 +799,14 @@ def open_donchian_position(symbol: str, signal_direction: str, entry_price: floa
 
     stop_price = (real_entry_price - atr14 * CHANDELIER_MULT if trade_direction == "LONG"
                   else real_entry_price + atr14 * CHANDELIER_MULT)
-    stop_side = "sell" if trade_direction == "LONG" else "buy"
-    try:
-        exchange.create_order(
-            symbol, type="STOP_MARKET", side=stop_side, amount=qty,
-            params={"stopPrice": stop_price, "reduceOnly": True},
-        )
-    except Exception as e:
-        close_err = _close_position(symbol, trade_direction, qty)
-        send_telegram_message(
-            f"⚠️ {symbol} (Donchian): koruyucu stop emri başarısız oldu ({e}) — "
-            f"pozisyon {'kapatıldı' if not close_err else 'KAPATILAMADI, MANUEL KONTROL ET: ' + close_err}."
-        )
-        return None
+    # ARTIK BORSAYA STOP EMRI KOYMUYORUZ - demo-fapi ortaminda fetch_open_orders()
+    # guvenilmez calisiyordu (sessizce yanlis/bos sonuc donduruyordu), bu da
+    # -4045 "max stop order limit" hatalarina ve gorunmez sekilde korumasiz
+    # kalan pozisyonlara yol aciyordu. Stop seviyesi SADECE bizim
+    # donchian_positions.csv kaydimizda tutuluyor, korunmasi
+    # update_donchian_trailing_stops() icindeki YAZILIMSAL fiyat kontrolu ile
+    # yapiliyor (her tarama turunda mevcut fiyat stop_price'i gecti mi diye
+    # bakip gectiyse hemen piyasa emriyle kapatiyor).
 
     rows = _read_donchian_positions()
     rows.append({
@@ -861,25 +866,6 @@ def update_donchian_trailing_stops():
             )
             continue
 
-        # GUVENLIK AGI: pozisyon acik ama borsada AKTIF bir stop emri yoksa
-        # (onceki bir hata, manuel mudahale, vs.) HEMEN yeniden koy - pozisyon
-        # asla korumasiz kalmasin.
-        try:
-            open_orders = exchange.fetch_open_orders(symbol)
-            has_stop_order = any(o.get("type", "").upper() in ("STOP_MARKET", "STOP") for o in open_orders)
-            if not has_stop_order:
-                stop_side = "sell" if direction == "LONG" else "buy"
-                exchange.create_order(
-                    symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
-                    params={"stopPrice": current_stop, "reduceOnly": True},
-                )
-                send_telegram_message(
-                    f"🛡️ [Donchian] {symbol}: AKTİF STOP EMRİ BULUNAMADI, güvenlik ağı devreye girdi — "
-                    f"stop {current_stop:.6f} seviyesinde yeniden koyuldu."
-                )
-        except Exception as e:
-            print(f"{symbol} (Donchian): stop emri kontrolu/yeniden koyma basarisiz ({e})")
-
         try:
             df = fetch_donchian_ohlcv_df(symbol, limit=DONCHIAN_TREND_EMA_PERIOD + 30)
             df = compute_donchian_indicators(df)
@@ -934,34 +920,31 @@ def update_donchian_trailing_stops():
                 still_open.append(r)
             continue
 
-        if new_stop != current_stop:
-            try:
-                stop_side = "sell" if direction == "LONG" else "buy"
-                # ONCE mevcut emirlerin ID'lerini not al (fiyat karsilastirmasi
-                # YAPMIYORUZ artik - float hassasiyeti yuzunden eslesme
-                # basarisiz olup emirlerin birikmesine, sonunda Binance'in
-                # "max stop order limit" hatasina yol acmisti).
-                try:
-                    old_order_ids = [o["id"] for o in exchange.fetch_open_orders(symbol)]
-                except Exception:
-                    old_order_ids = []
-
-                exchange.create_order(
-                    symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
-                    params={"stopPrice": new_stop, "reduceOnly": True},
+        # YAZILIMSAL STOP: borsaya STOP_MARKET emri KOYMUYORUZ (demo-fapi
+        # ortaminda fetch_open_orders() guvenilmez oldugu icin -4045
+        # hatalarina ve gorunmez sekilde korumasiz pozisyonlara yol aciyordu).
+        # Bunun yerine her turda GUNCEL fiyati stop_price ile karsilastirip,
+        # gecildiyse HEMEN piyasa emriyle kapatiyoruz.
+        stop_breached = (latest_close <= new_stop) if direction == "LONG" else (latest_close >= new_stop)
+        if stop_breached:
+            close_err = _close_position(symbol, direction, live_qty)
+            current_price = latest_close
+            raw_pct = (current_price - entry_price) / entry_price * 100
+            pct_change = raw_pct if direction == "LONG" else -raw_pct
+            if not close_err:
+                log_closed_trade(symbol, "Donchian Trend-Takip (orijinal)", signal_direction, entry_price, current_price, pct_change, "SL (yazılımsal stop)")
+                send_telegram_message(
+                    f"🐢 [Donchian] {symbol} {signal_direction} pozisyon stop'a takıldı (yazılımsal). "
+                    f"Giriş: {entry_price:.6f} | Çıkış: {current_price:.6f} | Değişim: {pct_change:+.2f}%"
                 )
-                # Yeni emir basariyla koyuldu - simdi ONCEDEN NOT ALINAN ESKI
-                # emirleri (ID'ye gore, fiyata gore DEGIL) iptal et.
-                for old_id in old_order_ids:
-                    try:
-                        exchange.cancel_order(old_id, symbol)
-                    except Exception as cancel_err:
-                        print(f"{symbol} (Donchian): eski emir {old_id} iptal edilemedi ({cancel_err})")
-                r["stop_price"] = str(new_stop)
-                r["extreme_price"] = str(new_extreme)
-                print(f"{symbol} (Donchian): trailing stop güncellendi {current_stop:.6f} -> {new_stop:.6f}")
-            except Exception as e:
-                print(f"{symbol} (Donchian): trailing stop güncellenemedi ({e}), ESKİ STOP HALA AKTİF (korumasız kalmadı)")
+            else:
+                print(f"{symbol} (Donchian): yazılımsal stop kapatma basarisiz ({close_err}), pozisyon acik birakildi")
+                still_open.append(r)
+            continue
+
+        if new_stop != current_stop:
+            r["stop_price"] = str(new_stop)
+            r["extreme_price"] = str(new_extreme)
 
         still_open.append(r)
 
@@ -1216,19 +1199,10 @@ def open_squeeze_position(symbol: str, signal_direction: str, entry_price: float
 
     stop_price = (real_entry_price - atr14 * SQUEEZE_ATR_STOP_MULT if trade_direction == "LONG"
                   else real_entry_price + atr14 * SQUEEZE_ATR_STOP_MULT)
-    stop_side = "sell" if trade_direction == "LONG" else "buy"
-    try:
-        exchange.create_order(
-            symbol, type="STOP_MARKET", side=stop_side, amount=qty,
-            params={"stopPrice": stop_price, "reduceOnly": True},
-        )
-    except Exception as e:
-        close_err = _close_position(symbol, trade_direction, qty)
-        send_telegram_message(
-            f"⚠️ {symbol} (Sıkışma+Kırılım): koruyucu stop emri başarısız oldu ({e}) — "
-            f"pozisyon {'kapatıldı' if not close_err else 'KAPATILAMADI, MANUEL KONTROL ET: ' + close_err}."
-        )
-        return None
+    # ARTIK BORSAYA STOP EMRI KOYMUYORUZ - Donchian tarafindaki ayni degisiklikle
+    # tutarli (bkz. open_donchian_position). Stop seviyesi sadece kayitta
+    # tutuluyor, korunmasi update_squeeze_trailing_stops() icindeki YAZILIMSAL
+    # fiyat kontrolu ile yapiliyor.
 
     rows = _read_squeeze_positions()
     rows.append({
@@ -1283,23 +1257,7 @@ def update_squeeze_trailing_stops():
             )
             continue
 
-        # GUVENLIK AGI: pozisyon acik ama borsada AKTIF bir stop emri yoksa,
-        # HEMEN yeniden koy - pozisyon asla korumasiz kalmasin.
-        try:
-            open_orders = exchange.fetch_open_orders(symbol)
-            has_stop_order = any(o.get("type", "").upper() in ("STOP_MARKET", "STOP") for o in open_orders)
-            if not has_stop_order:
-                stop_side = "sell" if direction == "LONG" else "buy"
-                exchange.create_order(
-                    symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
-                    params={"stopPrice": current_stop, "reduceOnly": True},
-                )
-                send_telegram_message(
-                    f"🛡️ [Sıkışma] {symbol}: AKTİF STOP EMRİ BULUNAMADI, güvenlik ağı devreye girdi — "
-                    f"stop {current_stop:.6f} seviyesinde yeniden koyuldu."
-                )
-        except Exception as e:
-            print(f"{symbol} (Sıkışma): stop emri kontrolu/yeniden koyma basarisiz ({e})")
+        # GUVENLIK AGI KALDIRILDI - artik borsaya STOP_MARKET koymuyoruz.
 
         try:
             df = fetch_squeeze_ohlcv_df(symbol, limit=SQUEEZE_BBW_LOOKBACK + 30)
@@ -1351,27 +1309,29 @@ def update_squeeze_trailing_stops():
                 still_open.append(r)
             continue
 
-        if new_stop != current_stop:
-            try:
-                stop_side = "sell" if direction == "LONG" else "buy"
-                try:
-                    old_order_ids = [o["id"] for o in exchange.fetch_open_orders(symbol)]
-                except Exception:
-                    old_order_ids = []
-
-                exchange.create_order(
-                    symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
-                    params={"stopPrice": new_stop, "reduceOnly": True},
+        # YAZILIMSAL STOP (bkz. update_donchian_trailing_stops'taki aciklama) -
+        # borsaya emir koymadan, guncel fiyati stop_price ile karsilastirip
+        # gecildiyse HEMEN piyasa emriyle kapatiyoruz.
+        stop_breached = (latest_close <= new_stop) if direction == "LONG" else (latest_close >= new_stop)
+        if stop_breached:
+            close_err = _close_position(symbol, direction, live_qty)
+            current_price = latest_close
+            raw_pct = (current_price - entry_price) / entry_price * 100
+            pct_change = raw_pct if direction == "LONG" else -raw_pct
+            if not close_err:
+                log_closed_trade(symbol, "Sıkışma+Kırılım", signal_direction, entry_price, current_price, pct_change, "SL (yazılımsal stop)")
+                send_telegram_message(
+                    f"🗜️ [Sıkışma+Kırılım] {symbol} {signal_direction} pozisyon stop'a takıldı (yazılımsal). "
+                    f"Giriş: {entry_price:.6f} | Çıkış: {current_price:.6f} | Değişim: {pct_change:+.2f}%"
                 )
-                for old_id in old_order_ids:
-                    try:
-                        exchange.cancel_order(old_id, symbol)
-                    except Exception as cancel_err:
-                        print(f"{symbol} (Sıkışma): eski emir {old_id} iptal edilemedi ({cancel_err})")
-                r["stop_price"] = str(new_stop)
-                r["extreme_price"] = str(new_extreme)
-            except Exception as e:
-                print(f"{symbol} (Sıkışma): trailing stop güncellenemedi ({e}), ESKİ STOP HALA AKTİF (korumasız kalmadı)")
+            else:
+                print(f"{symbol} (Sıkışma): yazılımsal stop kapatma basarisiz ({close_err}), pozisyon acik birakildi")
+                still_open.append(r)
+            continue
+
+        if new_stop != current_stop:
+            r["stop_price"] = str(new_stop)
+            r["extreme_price"] = str(new_extreme)
 
         still_open.append(r)
 
