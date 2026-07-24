@@ -196,8 +196,14 @@ DONCHIAN_TIMEFRAME = os.environ.get("DONCHIAN_TIMEFRAME", "15m")  # eskiden 4h -
 DONCHIAN_PERIOD = int(os.environ.get("DONCHIAN_PERIOD", "55"))
 DONCHIAN_TREND_EMA_PERIOD = int(os.environ.get("DONCHIAN_TREND_EMA_PERIOD_ENV", "200"))
 CHANDELIER_MULT = 3.0        # trailing stop mesafesi = ATR14(4h) * bu katsayi
+DONCHIAN_REVERSAL_EXIT_CANDLES = int(os.environ.get("DONCHIAN_REVERSAL_EXIT_CANDLES", "2"))
+# Pozisyon KARDAYKEN, yeni zirve/dip yapmayi birakip ust uste bu kadar mum
+# TERS yonde kapanirsa, ATR stop mesafesini beklemeden HEMEN piyasa emriyle
+# kapatilir - "artis durup dususe gecerken kari kilitle" mantigi. Henuz
+# kara gecmemis pozisyonlarda bu kural devreye girmez, ilk ATR stop korumasi
+# aynen calismaya devam eder.
 DONCHIAN_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "donchian_positions.csv")
-DONCHIAN_FIELDNAMES = ["symbol", "direction", "signal_direction", "entry_price", "stop_price", "extreme_price", "entry_time"]
+DONCHIAN_FIELDNAMES = ["symbol", "direction", "signal_direction", "entry_price", "stop_price", "extreme_price", "entry_time", "against_count"]
 # Sinyal tespit MANTIGI (Donchian kirilim + trend filtresi) KESINLIKLE degismiyor -
 # kullanicinin acikca istedigi gibi. Sadece GERCEK ISLEM ters yonde aciliyor,
 # Telegram bildirimi ise sinyalin ORIJINAL yonunu gostermeye devam ediyor
@@ -240,11 +246,12 @@ SQUEEZE_WINDOW = int(os.environ.get("SQUEEZE_WINDOW", "20"))  # kirilim seviyesi
 SQUEEZE_STRONG_BODY_MULT = float(os.environ.get("SQUEEZE_STRONG_BODY_MULT", "1.5"))
 SQUEEZE_BODY_AVG_WINDOW = int(os.environ.get("SQUEEZE_BODY_AVG_WINDOW", "20"))
 SQUEEZE_ATR_STOP_MULT = float(os.environ.get("SQUEEZE_ATR_STOP_MULT", "2.0"))  # ilk stop mesafesi = ATR14 * bu katsayi
+SQUEEZE_REVERSAL_EXIT_CANDLES = int(os.environ.get("SQUEEZE_REVERSAL_EXIT_CANDLES", "2"))
 SQUEEZE_TRAIL_MULT = float(os.environ.get("SQUEEZE_TRAIL_MULT", "2.0"))  # trailing stop mesafesi de ATR14 * bu katsayi
 SQUEEZE_RISK_PER_TRADE_PCT = float(os.environ.get("SQUEEZE_RISK_PER_TRADE_PCT", "10"))
 SQUEEZE_POSITION_PCT_OF_BALANCE = float(os.environ.get("SQUEEZE_POSITION_PCT_OF_BALANCE", "20"))
 SQUEEZE_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "squeeze_positions.csv")
-SQUEEZE_FIELDNAMES = ["symbol", "direction", "signal_direction", "entry_price", "stop_price", "extreme_price", "entry_time"]
+SQUEEZE_FIELDNAMES = ["symbol", "direction", "signal_direction", "entry_price", "stop_price", "extreme_price", "entry_time", "against_count"]
 SQUEEZE_REFERENCE_BALANCE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "squeeze_reference_balance.txt")
 # Kullanicinin Donchian'da istedigi ayni mantik: SINYAL TESPITI (sikisma+kirilim)
 # KESINLIKLE degismiyor. Sadece GERCEK ISLEM ters yonde aciliyor, Telegram
@@ -675,7 +682,10 @@ def _read_donchian_positions():
     if not os.path.isfile(DONCHIAN_STATE_FILE):
         return []
     with open(DONCHIAN_STATE_FILE, newline="") as f:
-        return list(csv.DictReader(f))
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        r.setdefault("against_count", "0")
+    return rows
 
 
 def _write_donchian_positions(rows):
@@ -781,7 +791,7 @@ def open_donchian_position(symbol: str, signal_direction: str, entry_price: floa
     rows.append({
         "symbol": symbol, "direction": trade_direction, "signal_direction": signal_direction,
         "entry_price": real_entry_price, "stop_price": stop_price, "extreme_price": real_entry_price,
-        "entry_time": datetime.now().isoformat(),
+        "entry_time": datetime.now().isoformat(), "against_count": "0",
     })
     _write_donchian_positions(rows)
 
@@ -873,10 +883,40 @@ def update_donchian_trailing_stops():
             new_extreme = max(extreme, latest_close)
             candidate_stop = new_extreme - latest_atr * CHANDELIER_MULT
             new_stop = max(current_stop, candidate_stop)
+            in_profit = latest_close > entry_price
         else:
             new_extreme = min(extreme, latest_close)
             candidate_stop = new_extreme + latest_atr * CHANDELIER_MULT
             new_stop = min(current_stop, candidate_stop)
+            in_profit = latest_close < entry_price
+
+        # KAR KİLİTLEME: yeni zirve/dip yapmayi biraktiysa (extreme guncellenmedi)
+        # VE pozisyon kardaysa, ust uste kac mumdur TERS gittigini say. Esige
+        # ulasinca ATR stop mesafesini beklemeden HEMEN kapat (kullanicinin
+        # istegi: "artis durup dususe geciyorken kari al, gevis vermeden cik").
+        against_count = int(r.get("against_count", "0"))
+        if new_extreme == extreme and in_profit:
+            against_count += 1
+        else:
+            against_count = 0
+        r["against_count"] = str(against_count)
+
+        if in_profit and against_count >= DONCHIAN_REVERSAL_EXIT_CANDLES:
+            close_err = _close_position(symbol, direction, live_qty)
+            current_price = latest_close
+            raw_pct = (current_price - entry_price) / entry_price * 100
+            pct_change = raw_pct if direction == "LONG" else -raw_pct
+            if not close_err:
+                log_closed_trade(symbol, "Donchian Trend-Takip (orijinal)", signal_direction, entry_price, current_price, pct_change, "TP (momentum döndü)")
+                send_telegram_message(
+                    f"✅ [Donchian] {symbol} {signal_direction} pozisyon KAR KİLİTLENDİ (momentum döndü, "
+                    f"{against_count} mum üst üste geri gitti). Giriş: {entry_price:.6f} | Çıkış: {current_price:.6f} | "
+                    f"Değişim: {pct_change:+.2f}%"
+                )
+            else:
+                print(f"{symbol} (Donchian): kar kilitleme kapatma basarisiz ({close_err}), pozisyon acik birakildi")
+                still_open.append(r)
+            continue
 
         if new_stop != current_stop:
             try:
@@ -1100,7 +1140,10 @@ def _read_squeeze_positions():
     if not os.path.isfile(SQUEEZE_STATE_FILE):
         return []
     with open(SQUEEZE_STATE_FILE, newline="") as f:
-        return list(csv.DictReader(f))
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        r.setdefault("against_count", "0")
+    return rows
 
 
 def _write_squeeze_positions(rows):
@@ -1175,7 +1218,7 @@ def open_squeeze_position(symbol: str, signal_direction: str, entry_price: float
     rows.append({
         "symbol": symbol, "direction": trade_direction, "signal_direction": signal_direction,
         "entry_price": real_entry_price, "stop_price": stop_price, "extreme_price": real_entry_price,
-        "entry_time": datetime.now().isoformat(),
+        "entry_time": datetime.now().isoformat(), "against_count": "0",
     })
     _write_squeeze_positions(rows)
 
@@ -1261,10 +1304,36 @@ def update_squeeze_trailing_stops():
             new_extreme = max(extreme, latest_close)
             candidate_stop = new_extreme - latest_atr * SQUEEZE_TRAIL_MULT
             new_stop = max(current_stop, candidate_stop)
+            in_profit = latest_close > entry_price
         else:
             new_extreme = min(extreme, latest_close)
             candidate_stop = new_extreme + latest_atr * SQUEEZE_TRAIL_MULT
             new_stop = min(current_stop, candidate_stop)
+            in_profit = latest_close < entry_price
+
+        against_count = int(r.get("against_count", "0"))
+        if new_extreme == extreme and in_profit:
+            against_count += 1
+        else:
+            against_count = 0
+        r["against_count"] = str(against_count)
+
+        if in_profit and against_count >= SQUEEZE_REVERSAL_EXIT_CANDLES:
+            close_err = _close_position(symbol, direction, live_qty)
+            current_price = latest_close
+            raw_pct = (current_price - entry_price) / entry_price * 100
+            pct_change = raw_pct if direction == "LONG" else -raw_pct
+            if not close_err:
+                log_closed_trade(symbol, "Sıkışma+Kırılım", signal_direction, entry_price, current_price, pct_change, "TP (momentum döndü)")
+                send_telegram_message(
+                    f"✅ [Sıkışma] {symbol} {signal_direction} pozisyon KAR KİLİTLENDİ (momentum döndü, "
+                    f"{against_count} mum üst üste geri gitti). Giriş: {entry_price:.6f} | Çıkış: {current_price:.6f} | "
+                    f"Değişim: {pct_change:+.2f}%"
+                )
+            else:
+                print(f"{symbol} (Sıkışma): kar kilitleme kapatma basarisiz ({close_err}), pozisyon acik birakildi")
+                still_open.append(r)
+            continue
 
         if new_stop != current_stop:
             try:
