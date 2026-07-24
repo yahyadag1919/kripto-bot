@@ -1924,6 +1924,10 @@ def scan_once():
             cleanup_orphaned_orders()
         except Exception as e:
             print(f"Basibos emir temizligi basarisiz ({e})")
+        try:
+            cleanup_duplicate_stop_orders()
+        except Exception as e:
+            print(f"Fazladan emir temizligi basarisiz ({e})")
 
     if SQUEEZE_MODE:
         # Sikisma+Kirilim modu digerlerinin (VWAP/Hacim/Donchian) ONUNE gecer -
