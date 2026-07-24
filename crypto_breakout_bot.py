@@ -1857,8 +1857,51 @@ def _emit_signal(symbol: str, strategy: str, strategy_desc: str, direction: str,
     log_pending(symbol, strategy, direction, logged_entry_price, datetime.now(), invalidation, qty=executed_qty)
 
 
+def cleanup_orphaned_orders():
+    """Her tarama turunde calisir: hesapta acik olan TUM emirleri ceker, ve
+    su an Donchian/Sikisma tarafindan takip edilen bir pozisyonu OLMAYAN
+    herhangi bir sembolde emir varsa iptal eder. cleanup_duplicate_stop_orders
+    sadece baslangicta ve sadece halen takip edilen semboller icin calisiyordu -
+    o yuzden gecmisten (eski VWAP/Hacim sistemi, kapanmis pozisyonlar, manuel
+    islemler, vs.) kalma basibos emirler hic temizlenmeden birikip Binance'in
+    hesap capindaki 'max stop order limit' hatasina (-4045) yol aciyordu, bu da
+    YENI pozisyon acilirken stop konulamamasina ve pozisyonun hemen zorla
+    kapatilmasina sebep oluyordu."""
+    tracked_symbols = set()
+    for r in _read_donchian_positions():
+        tracked_symbols.add(r["symbol"])
+    for r in _read_squeeze_positions():
+        tracked_symbols.add(r["symbol"])
+
+    try:
+        all_open_orders = exchange.fetch_open_orders()
+    except Exception as e:
+        print(f"Basibos emir taramasi basarisiz (tum emirler cekilemedi): {e}")
+        return
+
+    orphan_symbols = {}
+    for o in all_open_orders:
+        sym = o.get("symbol")
+        if sym and sym not in tracked_symbols:
+            orphan_symbols.setdefault(sym, []).append(o)
+
+    for sym, orders in orphan_symbols.items():
+        for o in orders:
+            try:
+                exchange.cancel_order(o["id"], sym)
+            except Exception as e:
+                print(f"{sym}: basibos emir {o['id']} iptal edilemedi ({e})")
+        print(f"{sym}: takip edilmeyen {len(orders)} basibos emir temizlendi")
+
+
 def scan_once():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Tarama basliyor...")
+
+    if DONCHIAN_MODE or SQUEEZE_MODE:
+        try:
+            cleanup_orphaned_orders()
+        except Exception as e:
+            print(f"Basibos emir temizligi basarisiz ({e})")
 
     if SQUEEZE_MODE:
         # Sikisma+Kirilim modu digerlerinin (VWAP/Hacim/Donchian) ONUNE gecer -
