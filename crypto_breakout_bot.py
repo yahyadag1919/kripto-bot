@@ -28,26 +28,16 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 # ---------------------------------------------------------------------------
 
 COINS = [
-    "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "AVAX", "LINK", "ADA", "SUI",
-    "DOT", "TRX", "ATOM", "NEAR", "TON", "LTC", "BCH", "ETC", "FIL", "APT",
-    "ARB", "OP", "INJ", "SEI", "ICP", "HBAR", "VET", "ALGO", "XLM", "EOS",
-    "XTZ", "SAND", "MANA", "AAVE", "UNI", "CRV", "GRT", "THETA", "EGLD",
-    "FLOW", "CHZ", "DYDX", "GALA", "IMX", "ONDO", "WLD",
-    "PEPE", "SHIB", "TIA", "STRK", "JUP", "PYTH", "JTO", "ENA", "ETHFI", "ORDI",
-    "BLUR", "LDO", "RPL", "FXS", "SSV", "CFX", "WOO", "GMX", "ZRX", "BAT",
-    "ENJ", "ZIL", "KDA", "ROSE", "ANKR", "CELO", "IOTA", "IOTX", "QTUM", "1INCH",
-    "COMP", "SNX", "YFI", "BAL", "STORJ", "OCEAN", "MASK", "LRC", "GMT", "APE",
-    "RSR", "SKL", "CTSI", "MTL", "DENT", "HOT", "RVN", "ICX", "ONT", "WAVES",
-    "KSM", "ZEC", "DASH", "MINA",
-    "ARKM", "AR", "RENDER", "AKT", "FET", "AGIX", "TAO", "NOT", "DOGS",
-    "FLOKI", "BONK", "WIF", "BOME", "MEME", "TURBO", "1000SATS", "PENDLE",
-    "ENS", "API3", "BAND", "UMA", "REN", "KNC", "SUSHI", "CAKE", "JOE", "RAY",
-    "SRM", "ALPHA", "BADGER", "ALCX", "TRB", "OXT", "NKN", "CTK", "COTI",
-    "ARPA", "LIT", "DUSK", "PERP", "MDT", "POLYX", "POWR", "REQ", "STMX",
-    "STPT", "TLM", "ALICE", "AXS", "SLP", "ILV", "YGG", "MAGIC", "PRIME",
-    "SUPER", "GHST", "AUDIO", "RLC", "NMR", "ORCA", "RAD", "GLMR", "MOVR",
-    "ASTR", "ACA", "PHA", "KLAY", "ONE", "FTM", "METIS", "BOBA", "CELR",
+    "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "AVAX", "LINK", "ADA", "TON",
 ]
+# NOT: eskiden 172 coin taranıyordu - kullanıcının kararıyla en büyük/en likit
+# 10 coine daraltıldı (2026-07-24). Sebep: az likit coinlerde borsa tarafı
+# garip hatalar (-1122 Invalid symbol status, -2027 max leverage position,
+# -4005 max quantity, vs.) sürekli çıkıyordu, hiçbiri büyük coinlerde
+# görülmedi; ayrıca kapsamlı backtest geçmişi hiçbir kategoride (kripto/emtia/
+# hisse) gerçek bir edge göstermediğinden, daha fazla coin taramak fırsatı
+# artırmıyor - sadece gürültü + işlem ücreti + borsa kaynaklı hata riskini
+# artırıyor. Eski liste (172 coin) gerekirse konuşma geçmişinde mevcut.
 
 WATCHLIST = [f"{c}/USDT:USDT" for c in COINS]
 
@@ -216,7 +206,7 @@ DONCHIAN_TIMEFRAME = os.environ.get("DONCHIAN_TIMEFRAME", "15m")  # eskiden 4h -
 DONCHIAN_PERIOD = int(os.environ.get("DONCHIAN_PERIOD", "55"))
 DONCHIAN_TREND_EMA_PERIOD = int(os.environ.get("DONCHIAN_TREND_EMA_PERIOD_ENV", "200"))
 CHANDELIER_MULT = 3.0        # trailing stop mesafesi = ATR14(4h) * bu katsayi
-DONCHIAN_REVERSAL_EXIT_CANDLES = int(os.environ.get("DONCHIAN_REVERSAL_EXIT_CANDLES", "2"))
+DONCHIAN_REVERSAL_EXIT_CANDLES = int(os.environ.get("DONCHIAN_REVERSAL_EXIT_CANDLES", "6"))
 # Pozisyon KARDAYKEN, yeni zirve/dip yapmayi birakip ust uste bu kadar mum
 # TERS yonde kapanirsa, ATR stop mesafesini beklemeden HEMEN piyasa emriyle
 # kapatilir - "artis durup dususe gecerken kari kilitle" mantigi. Henuz
@@ -228,7 +218,7 @@ DONCHIAN_FIELDNAMES = ["symbol", "direction", "signal_direction", "entry_price",
 # kullanicinin acikca istedigi gibi. Sadece GERCEK ISLEM ters yonde aciliyor,
 # Telegram bildirimi ise sinyalin ORIJINAL yonunu gostermeye devam ediyor
 # (yani LONG sinyali gelirse bildirim hala "LONG" yazar, ama borsada SHORT acilir).
-DONCHIAN_INVERT_EXECUTION = os.environ.get("DONCHIAN_INVERT_EXECUTION", "true").lower() == "true"
+DONCHIAN_INVERT_EXECUTION = os.environ.get("DONCHIAN_INVERT_EXECUTION", "false").lower() == "true"
 # Kullanicinin istegiyle: stop'a takilirsa kaybedilecek DOLAR miktari dogrudan
 # bakiyenin bu yuzdesi olacak sekilde pozisyon boyutlandiriliyor (ATR mesafesi
 # ne olursa olsun sonuc hep ayni % kayip). Marjin tavani da buna gore genisletildi
@@ -266,11 +256,23 @@ SQUEEZE_WINDOW = int(os.environ.get("SQUEEZE_WINDOW", "20"))  # kirilim seviyesi
 SQUEEZE_STRONG_BODY_MULT = float(os.environ.get("SQUEEZE_STRONG_BODY_MULT", "1.5"))
 SQUEEZE_BODY_AVG_WINDOW = int(os.environ.get("SQUEEZE_BODY_AVG_WINDOW", "20"))
 SQUEEZE_ATR_STOP_MULT = float(os.environ.get("SQUEEZE_ATR_STOP_MULT", "2.0"))  # ilk stop mesafesi = ATR14 * bu katsayi
-SQUEEZE_REVERSAL_EXIT_CANDLES = int(os.environ.get("SQUEEZE_REVERSAL_EXIT_CANDLES", "2"))
+SQUEEZE_REVERSAL_EXIT_CANDLES = int(os.environ.get("SQUEEZE_REVERSAL_EXIT_CANDLES", "6"))
 SQUEEZE_TRAIL_MULT = float(os.environ.get("SQUEEZE_TRAIL_MULT", "2.0"))  # trailing stop mesafesi de ATR14 * bu katsayi
 SQUEEZE_RISK_PER_TRADE_PCT = float(os.environ.get("SQUEEZE_RISK_PER_TRADE_PCT", "10"))
 SQUEEZE_POSITION_PCT_OF_BALANCE = float(os.environ.get("SQUEEZE_POSITION_PCT_OF_BALANCE", "20"))
 SQUEEZE_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "squeeze_positions.csv")
+
+# --- 1. KATMAN: Haber & Duygu Analizi (SADECE GOZLEM - hicbir islemi
+# etkilemiyor). Alternative.me'nin ucretsiz, KAYIT/ANAHTAR GEREKTIRMEYEN
+# "Fear & Greed Index" (Korku & Acgozluluk Endeksi) API'sinden piyasa-geneli
+# bir duygu skoru (0-100) cekip sentiment_log.csv'ye kaydediyor. Amac: birkac
+# hafta veri biriktirip skorun fiyatla gercekten iliskili olup olmadigina
+# bakmak - iliski KANITLANMADAN hicbir trading kararina baglanmayacak.
+FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1"
+SENTIMENT_POLL_INTERVAL_MINUTES = int(os.environ.get("SENTIMENT_POLL_INTERVAL_MINUTES", "20"))
+SENTIMENT_LOG_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "sentiment_log.csv")
+SENTIMENT_FIELDNAMES = ["timestamp", "fear_greed_value", "fear_greed_label", "btc_price"]
+_last_sentiment_poll_time = None
 SQUEEZE_FIELDNAMES = ["symbol", "direction", "signal_direction", "entry_price", "stop_price", "extreme_price", "entry_time", "against_count"]
 SQUEEZE_REFERENCE_BALANCE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "squeeze_reference_balance.txt")
 # Kullanicinin Donchian'da istedigi ayni mantik: SINYAL TESPITI (sikisma+kirilim)
@@ -278,7 +280,7 @@ SQUEEZE_REFERENCE_BALANCE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "
 # bildirimi sinyalin ORIJINAL yonunu gostermeye devam ediyor (coin zaten dipteyken
 # SHORT acilmasi gibi durumlari onlemek icin - kullanici XRPUSDT/ENJUSDT ornekleriyle
 # bunu acikca istedi).
-SQUEEZE_INVERT_EXECUTION = os.environ.get("SQUEEZE_INVERT_EXECUTION", "true").lower() == "true"
+SQUEEZE_INVERT_EXECUTION = os.environ.get("SQUEEZE_INVERT_EXECUTION", "false").lower() == "true"
 
 # --- Native TP (Take Profit) emri ---
 # Binance'e, checkpoint dongusunun beklemesine gerek kalmadan aninda tetiklenecek
@@ -1948,8 +1950,67 @@ def cleanup_orphaned_orders():
         print(f"{sym}: takip edilmeyen {len(orders)} basibos emir temizlendi")
 
 
+def _fetch_fear_greed():
+    """Alternative.me'nin ucretsiz, anahtar gerektirmeyen Fear & Greed Index
+    API'sinden piyasa-geneli guncel duygu skorunu ceker. (deger, etiket)
+    dondurur - deger 0 (asiri korku) ile 100 (asiri acgozluluk) arasinda.
+    Basarisiz olursa (None, None) doner."""
+    try:
+        resp = requests.get(FEAR_GREED_URL, timeout=15)
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+        if not data:
+            return None, None
+        entry = data[0]
+        return int(entry.get("value")), entry.get("value_classification")
+    except Exception as e:
+        print(f"[Duygu] Fear & Greed cekilemedi ({e})")
+        return None, None
+
+
+def _log_sentiment_row(fg_value, fg_label, btc_price):
+    is_new = not os.path.isfile(SENTIMENT_LOG_FILE)
+    with open(SENTIMENT_LOG_FILE, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=SENTIMENT_FIELDNAMES)
+        if is_new:
+            writer.writeheader()
+        writer.writerow({
+            "timestamp": datetime.now().isoformat(),
+            "fear_greed_value": "" if fg_value is None else fg_value,
+            "fear_greed_label": fg_label or "",
+            "btc_price": "" if btc_price is None else btc_price,
+        })
+
+
+def poll_sentiment_if_due():
+    """Ana tarama dongusunden cagrilir - ama SENTIMENT_POLL_INTERVAL_MINUTES'ten
+    daha sik gercek cagri yapmaz. Hicbir islemi etkilemez, sadece loglar; hata
+    olursa sessizce atlar (ana botu ASLA bozmaz). API anahtari GEREKMIYOR."""
+    global _last_sentiment_poll_time
+    now = datetime.now()
+    if _last_sentiment_poll_time is not None:
+        elapsed_min = (now - _last_sentiment_poll_time).total_seconds() / 60
+        if elapsed_min < SENTIMENT_POLL_INTERVAL_MINUTES:
+            return
+    _last_sentiment_poll_time = now
+
+    fg_value, fg_label = _fetch_fear_greed()
+    try:
+        btc_price = exchange.fetch_ticker("BTC/USDT:USDT").get("last")
+    except Exception:
+        btc_price = None
+    _log_sentiment_row(fg_value, fg_label, btc_price)
+    if fg_value is not None:
+        print(f"[Duygu] Fear & Greed: {fg_value} ({fg_label}) | BTC: {btc_price}")
+
+
 def scan_once():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Tarama basliyor...")
+
+    try:
+        poll_sentiment_if_due()
+    except Exception as e:
+        print(f"[Duygu] beklenmeyen hata, atlaniyor ({e})")
 
     if DONCHIAN_MODE or SQUEEZE_MODE:
         try:
