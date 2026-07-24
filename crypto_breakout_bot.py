@@ -481,6 +481,9 @@ def process_telegram_updates():
             if text.startswith("/orders"):
                 send_telegram_message(build_orders_message())
                 continue
+            if text.startswith("/debug"):
+                send_telegram_message(build_debug_message())
+                continue
 
         cq = update.get("callback_query")
         if not cq:
@@ -1521,6 +1524,41 @@ def log_closed_trade(symbol, strategy, direction, entry_price, exit_price, pct_c
             f"{pct_change:.3f}" if pct_change is not None else "",
             sonuc,
         ])
+
+
+def build_debug_message():
+    """Ham teshis: SOL ve AVAX'ta (su an kesin acik pozisyonu olan iki coin)
+    fetch_positions ve fetch_open_orders'in GERCEKTE ne dondurdugunu (veya
+    hangi hatayi verdigini) birebir gosterir - /orders'in neden 'hic emir yok'
+    dedigini anlamak icin."""
+    lines = ["🔧 Ham teşhis:"]
+    lines.append(f"exchange.id: {exchange.id}")
+    try:
+        sample_url = exchange.urls["api"]
+        if isinstance(sample_url, dict):
+            first_key = next(iter(sample_url))
+            lines.append(f"urls['api']['{first_key}']: {sample_url[first_key]}")
+    except Exception as e:
+        lines.append(f"urls okunamadi: {e}")
+    lines.append(f"USE_TESTNET: {USE_TESTNET}")
+
+    for sym in ["SOL/USDT:USDT", "AVAX/USDT:USDT"]:
+        lines.append(f"\n— {sym} —")
+        try:
+            positions = exchange.fetch_positions([sym])
+            live = [p for p in positions if abs(float(p.get("contracts") or 0)) > 0]
+            lines.append(f"fetch_positions: {len(positions)} kayıt, {len(live)} canlı (miktar>0)")
+        except Exception as e:
+            lines.append(f"fetch_positions HATA: {e}")
+        try:
+            orders = exchange.fetch_open_orders(sym)
+            lines.append(f"fetch_open_orders({sym}): {len(orders)} emir")
+            for o in orders[:3]:
+                lines.append(f"  - id={o.get('id')} type={o.get('type')} stopPrice={o.get('stopPrice')}")
+        except Exception as e:
+            lines.append(f"fetch_open_orders HATA: {e}")
+
+    return "\n".join(lines)
 
 
 def build_orders_message():
