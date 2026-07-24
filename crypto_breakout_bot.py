@@ -477,7 +477,10 @@ def process_telegram_updates():
                     except ValueError:
                         pass
                 send_telegram_message(build_stats_message(hours))
-            continue
+                continue
+            if text.startswith("/orders"):
+                send_telegram_message(build_orders_message())
+                continue
 
         cq = update.get("callback_query")
         if not cq:
@@ -1518,6 +1521,42 @@ def log_closed_trade(symbol, strategy, direction, entry_price, exit_price, pct_c
             f"{pct_change:.3f}" if pct_change is not None else "",
             sonuc,
         ])
+
+
+def build_orders_message():
+    """Hesaptaki TUM acik emirleri sembole gore gruplar - Telegram'da tek
+    mesajla ozet gorup, dusuncesiz ekran goruntusu almadan hangi sembolde
+    kac emir birikmis oldugunu teshis etmek icin."""
+    try:
+        all_open_orders = exchange.fetch_open_orders()
+    except Exception as e:
+        print(f"/orders: hesap capinda cekilemedi ({e}), sembol sembol deneniyor...")
+        all_open_orders = []
+        for sym in WATCHLIST:
+            try:
+                all_open_orders.extend(exchange.fetch_open_orders(sym))
+            except Exception:
+                pass
+
+    if not all_open_orders:
+        return "📋 Hesapta hiç açık emir yok."
+
+    tracked_symbols = set()
+    for r in _read_donchian_positions():
+        tracked_symbols.add(r["symbol"])
+    for r in _read_squeeze_positions():
+        tracked_symbols.add(r["symbol"])
+
+    counts = {}
+    for o in all_open_orders:
+        sym = o.get("symbol", "?")
+        counts[sym] = counts.get(sym, 0) + 1
+
+    lines = [f"📋 Toplam {len(all_open_orders)} açık emir, {len(counts)} sembolde:"]
+    for sym, cnt in sorted(counts.items(), key=lambda x: -x[1]):
+        tag = " (takip ediliyor)" if sym in tracked_symbols else " (TAKİP EDİLMİYOR - başıboş olmalı)"
+        lines.append(f"  {sym}: {cnt}{tag}")
+    return "\n".join(lines)
 
 
 def build_stats_message(hours=None):
