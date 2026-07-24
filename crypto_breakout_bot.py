@@ -1526,26 +1526,27 @@ def log_closed_trade(symbol, strategy, direction, entry_price, exit_price, pct_c
 def build_orders_message():
     """Hesaptaki TUM acik emirleri sembole gore gruplar - Telegram'da tek
     mesajla ozet gorup, dusuncesiz ekran goruntusu almadan hangi sembolde
-    kac emir birikmis oldugunu teshis etmek icin."""
-    try:
-        all_open_orders = exchange.fetch_open_orders()
-    except Exception as e:
-        print(f"/orders: hesap capinda cekilemedi ({e}), sembol sembol deneniyor...")
-        all_open_orders = []
-        for sym in WATCHLIST:
-            try:
-                all_open_orders.extend(exchange.fetch_open_orders(sym))
-            except Exception:
-                pass
-
-    if not all_open_orders:
-        return "📋 Hesapta hiç açık emir yok."
-
+    kac emir birikmis oldugunu teshis etmek icin.
+    NOT: hesap-capinda (sembolsuz) fetch_open_orders() demo hesapta hata
+    vermeden ama BOS donuyor (guvenilmez) - o yuzden dogrudan sembol sembol
+    sorgulanıyor (bu yontemin calistigi trailing-stop guvenlik agindan
+    dogrulandi)."""
     tracked_symbols = set()
     for r in _read_donchian_positions():
         tracked_symbols.add(r["symbol"])
     for r in _read_squeeze_positions():
         tracked_symbols.add(r["symbol"])
+
+    all_open_orders = []
+    for sym in WATCHLIST:
+        try:
+            sym_orders = exchange.fetch_open_orders(sym)
+            all_open_orders.extend(sym_orders)
+        except Exception:
+            pass
+
+    if not all_open_orders:
+        return "📋 Hesapta hiç açık emir yok."
 
     counts = {}
     for o in all_open_orders:
@@ -1907,38 +1908,32 @@ def _emit_signal(symbol: str, strategy: str, strategy_desc: str, direction: str,
 
 
 def cleanup_orphaned_orders():
-    """Her tarama turunde calisir: hesapta acik olan TUM emirleri ceker, ve
-    su an Donchian/Sikisma tarafindan takip edilen bir pozisyonu OLMAYAN
-    herhangi bir sembolde emir varsa iptal eder. cleanup_duplicate_stop_orders
-    sadece baslangicta ve sadece halen takip edilen semboller icin calisiyordu -
-    o yuzden gecmisten (eski VWAP/Hacim sistemi, kapanmis pozisyonlar, manuel
-    islemler, vs.) kalma basibos emirler hic temizlenmeden birikip Binance'in
-    hesap capindaki 'max stop order limit' hatasina (-4045) yol aciyordu, bu da
-    YENI pozisyon acilirken stop konulamamasina ve pozisyonun hemen zorla
-    kapatilmasina sebep oluyordu."""
+    """Her tarama turunde calisir: WATCHLIST'teki her sembolu TEK TEK sorgulayip
+    (hesap-capinda/sembolsuz fetch_open_orders() demo hesapta hata vermeden
+    ama BOS donuyor - guvenilmez, o yuzden kullanilmiyor), su an Donchian/
+    Sikisma tarafindan takip edilen bir pozisyonu OLMAYAN herhangi bir sembolde
+    emir varsa iptal eder. cleanup_duplicate_stop_orders sadece baslangicta ve
+    sadece halen takip edilen semboller icin calisiyordu - o yuzden gecmisten
+    (eski VWAP/Hacim sistemi, kapanmis pozisyonlar, manuel islemler, vs.) kalma
+    basibos emirler hic temizlenmeden birikip Binance'in hesap capindaki
+    'max stop order limit' hatasina (-4045) yol aciyordu, bu da YENI pozisyon
+    acilirken stop konulamamasina ve pozisyonun hemen zorla kapatilmasina
+    sebep oluyordu."""
     tracked_symbols = set()
     for r in _read_donchian_positions():
         tracked_symbols.add(r["symbol"])
     for r in _read_squeeze_positions():
         tracked_symbols.add(r["symbol"])
 
-    try:
-        all_open_orders = exchange.fetch_open_orders()
-    except Exception as e:
-        print(f"Basibos emir taramasi (hesap capinda) basarisiz ({e}) - sembol sembol yedek plana geciliyor...")
-        # YEDEK PLAN: hesap capinda tek cagri calismazsa, WATCHLIST'teki her
-        # sembolu TEK TEK sorgula (bu sekilde cagirmak asla o uyariyi
-        # vermiyor, garantili calisir - ama daha yavas, o yuzden sadece
-        # ana yontem basarisiz olunca devreye giriyor).
-        all_open_orders = []
-        for sym in WATCHLIST:
-            if sym in tracked_symbols:
-                continue
-            try:
-                sym_orders = exchange.fetch_open_orders(sym)
-                all_open_orders.extend(sym_orders)
-            except Exception:
-                pass
+    all_open_orders = []
+    for sym in WATCHLIST:
+        if sym in tracked_symbols:
+            continue
+        try:
+            sym_orders = exchange.fetch_open_orders(sym)
+            all_open_orders.extend(sym_orders)
+        except Exception:
+            pass
 
     orphan_symbols = {}
     for o in all_open_orders:
