@@ -1,6 +1,8 @@
 import os
 import csv
 import time
+import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
 import ccxt
@@ -263,15 +265,21 @@ SQUEEZE_POSITION_PCT_OF_BALANCE = float(os.environ.get("SQUEEZE_POSITION_PCT_OF_
 SQUEEZE_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "squeeze_positions.csv")
 
 # --- 1. KATMAN: Haber & Duygu Analizi (SADECE GOZLEM - hicbir islemi
-# etkilemiyor). Alternative.me'nin ucretsiz, KAYIT/ANAHTAR GEREKTIRMEYEN
-# "Fear & Greed Index" (Korku & Acgozluluk Endeksi) API'sinden piyasa-geneli
-# bir duygu skoru (0-100) cekip sentiment_log.csv'ye kaydediyor. Amac: birkac
+# etkilemiyor). CoinDesk/CoinTelegraph RSS'lerinden son haber basliklarini
+# cekip Google Gemini API'sine (ucretsiz katman) gonderip -1..+1 arasi bir
+# duygu skoru cikartiyor, sentiment_log.csv'ye kaydediyor. Amac: birkac
 # hafta veri biriktirip skorun fiyatla gercekten iliskili olup olmadigina
 # bakmak - iliski KANITLANMADAN hicbir trading kararina baglanmayacak.
-FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+RSS_FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+]
 SENTIMENT_POLL_INTERVAL_MINUTES = int(os.environ.get("SENTIMENT_POLL_INTERVAL_MINUTES", "20"))
 SENTIMENT_LOG_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "sentiment_log.csv")
-SENTIMENT_FIELDNAMES = ["timestamp", "fear_greed_value", "fear_greed_label", "btc_price"]
+SENTIMENT_FIELDNAMES = ["timestamp", "sentiment_score", "num_headlines", "btc_price"]
 _last_sentiment_poll_time = None
 SQUEEZE_FIELDNAMES = ["symbol", "direction", "signal_direction", "entry_price", "stop_price", "extreme_price", "entry_time", "against_count"]
 SQUEEZE_REFERENCE_BALANCE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "squeeze_reference_balance.txt")
@@ -495,6 +503,9 @@ def process_telegram_updates():
                 continue
             if text.startswith("/debug"):
                 send_telegram_message(build_debug_message())
+                continue
+            if text.startswith("/sentiment"):
+                send_telegram_message(build_sentiment_message())
                 continue
 
         cq = update.get("callback_query")
@@ -1950,25 +1961,60 @@ def cleanup_orphaned_orders():
         print(f"{sym}: takip edilmeyen {len(orders)} basibos emir temizlendi")
 
 
-def _fetch_fear_greed():
-    """Alternative.me'nin ucretsiz, anahtar gerektirmeyen Fear & Greed Index
-    API'sinden piyasa-geneli guncel duygu skorunu ceker. (deger, etiket)
-    dondurur - deger 0 (asiri korku) ile 100 (asiri acgozluluk) arasinda.
-    Basarisiz olursa (None, None) doner."""
+def _fetch_recent_headlines(limit=15):
+    """CoinDesk/CoinTelegraph RSS'lerinden son haber basliklarini ceker.
+    Basit XML parse - ek kutuphane gerektirmiyor (stdlib xml.etree)."""
+    headlines = []
+    for feed_url in RSS_FEEDS:
+        try:
+            resp = requests.get(feed_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+            for item in root.findall(".//item"):
+                title_el = item.find("title")
+                if title_el is not None and title_el.text:
+                    headlines.append(title_el.text.strip())
+        except Exception as e:
+            print(f"[Duygu] RSS cekilemedi ({feed_url}): {e}")
+    return headlines[:limit]
+
+
+def _score_headlines_with_gemini(headlines):
+    """Basliklari Gemini API'sine gonderip -1 (cok kotumser) ile +1 (cok
+    iyimser) arasi TEK bir kripto piyasasi duygu skoru istiyor. Basarisiz
+    olursa None doner."""
+    if not GEMINI_API_KEY or not headlines:
+        return None
+
+    prompt = (
+        "Asagida son kripto para haberlerinin basliklari var. Bu basliklara "
+        "bakarak GENEL kripto piyasasi icin bir duygu skoru ver: -1 (cok "
+        "kotumser/dususe isaret) ile +1 (cok iyimser/yukselise isaret) arasinda "
+        "bir ONDALIK SAYI. SADECE sayiyi yaz, baska hicbir aciklama, kelime, "
+        "yildiz isareti ekleme.\n\nBasliklar:\n"
+        + "\n".join(f"- {h}" for h in headlines)
+    )
     try:
-        resp = requests.get(FEAR_GREED_URL, timeout=15)
+        resp = requests.post(
+            f"{GEMINI_API_URL}?key={GEMINI_API_KEY}",
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=30,
+        )
         resp.raise_for_status()
-        data = resp.json().get("data", [])
-        if not data:
-            return None, None
-        entry = data[0]
-        return int(entry.get("value")), entry.get("value_classification")
+        data = resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        match = re.search(r"-?\d*\.?\d+", text)
+        if not match:
+            print(f"[Duygu] Gemini yanitindan sayi cikarilamadi: {text!r}")
+            return None
+        score = float(match.group())
+        return max(-1.0, min(1.0, score))
     except Exception as e:
-        print(f"[Duygu] Fear & Greed cekilemedi ({e})")
-        return None, None
+        print(f"[Duygu] Gemini cagrisi basarisiz ({e})")
+        return None
 
 
-def _log_sentiment_row(fg_value, fg_label, btc_price):
+def _log_sentiment_row(score, num_headlines, btc_price):
     is_new = not os.path.isfile(SENTIMENT_LOG_FILE)
     with open(SENTIMENT_LOG_FILE, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=SENTIMENT_FIELDNAMES)
@@ -1976,16 +2022,44 @@ def _log_sentiment_row(fg_value, fg_label, btc_price):
             writer.writeheader()
         writer.writerow({
             "timestamp": datetime.now().isoformat(),
-            "fear_greed_value": "" if fg_value is None else fg_value,
-            "fear_greed_label": fg_label or "",
+            "sentiment_score": "" if score is None else f"{score:.3f}",
+            "num_headlines": num_headlines,
             "btc_price": "" if btc_price is None else btc_price,
         })
+
+
+def build_sentiment_message():
+    """sentiment_log.csv'yi okuyup Telegram'da gosterilecek kisa bir ozet
+    hazirlar: en son deger + son birkac kaydin listesi."""
+    if not os.path.isfile(SENTIMENT_LOG_FILE):
+        return "📰 Henüz hiç duygu verisi kaydedilmemiş (bot en az bir tarama turu tamamlamalı)."
+
+    with open(SENTIMENT_LOG_FILE, newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    if not rows:
+        return "📰 Henüz hiç duygu verisi kaydedilmemiş."
+
+    latest = rows[-1]
+    lines = [
+        f"📰 Güncel duygu skoru: {latest['sentiment_score']} ({latest['num_headlines']} başlık)",
+        f"BTC fiyatı (o an): {latest['btc_price']}",
+        f"Toplam kayıt sayısı: {len(rows)}",
+        "",
+        "Son 5 kayıt:",
+    ]
+    for row in rows[-5:]:
+        ts = row["timestamp"].split("T")[1][:5] if "T" in row["timestamp"] else row["timestamp"]
+        lines.append(f"  {ts} — skor: {row['sentiment_score']} | BTC: {row['btc_price']}")
+
+    return "\n".join(lines)
 
 
 def poll_sentiment_if_due():
     """Ana tarama dongusunden cagrilir - ama SENTIMENT_POLL_INTERVAL_MINUTES'ten
     daha sik gercek cagri yapmaz. Hicbir islemi etkilemez, sadece loglar; hata
-    olursa sessizce atlar (ana botu ASLA bozmaz). API anahtari GEREKMIYOR."""
+    olursa (RSS, Gemini, GEMINI_API_KEY eksikligi) sessizce atlar (ana botu
+    ASLA bozmaz)."""
     global _last_sentiment_poll_time
     now = datetime.now()
     if _last_sentiment_poll_time is not None:
@@ -1994,14 +2068,15 @@ def poll_sentiment_if_due():
             return
     _last_sentiment_poll_time = now
 
-    fg_value, fg_label = _fetch_fear_greed()
+    headlines = _fetch_recent_headlines()
+    score = _score_headlines_with_gemini(headlines)
     try:
         btc_price = exchange.fetch_ticker("BTC/USDT:USDT").get("last")
     except Exception:
         btc_price = None
-    _log_sentiment_row(fg_value, fg_label, btc_price)
-    if fg_value is not None:
-        print(f"[Duygu] Fear & Greed: {fg_value} ({fg_label}) | BTC: {btc_price}")
+    _log_sentiment_row(score, len(headlines), btc_price)
+    if score is not None:
+        print(f"[Duygu] Skor: {score:+.3f} ({len(headlines)} başlık) | BTC: {btc_price}")
 
 
 def scan_once():
