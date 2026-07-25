@@ -30,16 +30,34 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 # ---------------------------------------------------------------------------
 
 COINS = [
-    "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "AVAX", "LINK", "ADA", "TON",
+    "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "AVAX", "LINK", "ADA", "SUI",
+    "DOT", "TRX", "ATOM", "NEAR", "TON", "LTC", "BCH", "ETC", "FIL", "APT",
+    "ARB", "OP", "INJ", "SEI", "ICP", "HBAR", "VET", "ALGO", "XLM", "EOS",
+    "XTZ", "SAND", "MANA", "AAVE", "UNI", "CRV", "GRT", "THETA", "EGLD",
+    "FLOW", "CHZ", "DYDX", "GALA", "IMX", "ONDO", "WLD",
+    "PEPE", "SHIB", "TIA", "STRK", "JUP", "PYTH", "JTO", "ENA", "ETHFI", "ORDI",
+    "BLUR", "LDO", "RPL", "FXS", "SSV", "CFX", "WOO", "GMX", "ZRX", "BAT",
+    "ENJ", "ZIL", "KDA", "ROSE", "ANKR", "CELO", "IOTA", "IOTX", "QTUM", "1INCH",
+    "COMP", "SNX", "YFI", "BAL", "STORJ", "OCEAN", "MASK", "LRC", "GMT", "APE",
+    "RSR", "SKL", "CTSI", "MTL", "DENT", "HOT", "RVN", "ICX", "ONT", "WAVES",
+    "KSM", "ZEC", "DASH", "MINA",
+    "ARKM", "AR", "RENDER", "AKT", "FET", "AGIX", "TAO", "NOT", "DOGS",
+    "FLOKI", "BONK", "WIF", "BOME", "MEME", "TURBO", "1000SATS", "PENDLE",
+    "ENS", "API3", "BAND", "UMA", "REN", "KNC", "SUSHI", "CAKE", "JOE", "RAY",
+    "SRM", "ALPHA", "BADGER", "ALCX", "TRB", "OXT", "NKN", "CTK", "COTI",
+    "ARPA", "LIT", "DUSK", "PERP", "MDT", "POLYX", "POWR", "REQ", "STMX",
+    "STPT", "TLM", "ALICE", "AXS", "SLP", "ILV", "YGG", "MAGIC", "PRIME",
+    "SUPER", "GHST", "AUDIO", "RLC", "NMR", "ORCA", "RAD", "GLMR", "MOVR",
+    "ASTR", "ACA", "PHA", "KLAY", "ONE", "FTM", "METIS", "BOBA", "CELR",
 ]
-# NOT: eskiden 172 coin taranıyordu - kullanıcının kararıyla en büyük/en likit
-# 10 coine daraltıldı (2026-07-24). Sebep: az likit coinlerde borsa tarafı
-# garip hatalar (-1122 Invalid symbol status, -2027 max leverage position,
-# -4005 max quantity, vs.) sürekli çıkıyordu, hiçbiri büyük coinlerde
-# görülmedi; ayrıca kapsamlı backtest geçmişi hiçbir kategoride (kripto/emtia/
-# hisse) gerçek bir edge göstermediğinden, daha fazla coin taramak fırsatı
-# artırmıyor - sadece gürültü + işlem ücreti + borsa kaynaklı hata riskini
-# artırıyor. Eski liste (172 coin) gerekirse konuşma geçmişinde mevcut.
+# NOT: 2026-07-24'te "az likit coinlerde garip hata cikiyor" gerekcesiyle
+# 10'a daraltilmisti, 2026-07-25'te kullanicinin karariyla tekrar genisletildi -
+# artik SMC_MODE'daki sentiment esigi (SMC_SENTIMENT_THRESHOLD) zaten secici
+# davranip yon belirsizken hicbir sey taramadigi icin, coin sayisini
+# genisletmek "cok fazla islem" riski yaratmiyor (MAX_OPEN_POSITIONS da ayrica
+# sinirliyor), sadece gercek bir yon belirince tarama alanini/firsat sayisini
+# artiriyor. Donchian/Sikisma modlari icin eski -1122/-2027/-4005 turu
+# hatalar hala az likit coinlerde cikabilir - o modlari kullanirken dikkat.
 
 WATCHLIST = [f"{c}/USDT:USDT" for c in COINS]
 
