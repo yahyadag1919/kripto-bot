@@ -2374,19 +2374,29 @@ def scan_smc_once():
     if bias is None:
         return
 
+    scanned = 0
+    fetch_failed = 0
+    sweep_found = 0
+    zone_found = 0
+
     for symbol in WATCHLIST:
         if symbol in open_symbols or symbol in pending_symbols:
             continue
         if len(open_symbols) + len(pending_symbols) >= MAX_OPEN_POSITIONS:
             break
+        scanned += 1
         try:
             df = fetch_smc_ohlcv_df(symbol, limit=SMC_SWEEP_LOOKBACK + 40)
-        except Exception:
+        except Exception as e:
+            fetch_failed += 1
+            if fetch_failed <= 3:
+                print(f"[Balina/SMC] {symbol}: veri cekilemedi ({e})")
             continue
 
         sweep_dir = detect_liquidity_sweep(df)
         if sweep_dir != bias:
             continue
+        sweep_found += 1
 
         sweep_idx = len(df) - 2
         atr14 = df.iloc[sweep_idx]["atr14"]
@@ -2400,6 +2410,7 @@ def scan_smc_once():
             zone_type = "FVG"
         if zone is None:
             continue
+        zone_found += 1
 
         zone_low, zone_high = zone
         pending_symbols.add(symbol)
@@ -2413,6 +2424,9 @@ def scan_smc_once():
             f"🔍 [Balina/SMC] {symbol}: {sweep_dir} likidite süpürmesi + {zone_type} bulundu.\n"
             f"Bölge: {zone_low:.6f} - {zone_high:.6f} — fiyatın buraya gelmesi bekleniyor."
         )
+
+    print(f"[Balina/SMC] Tur özeti: yön={bias} | taranan={scanned} | veri hatası={fetch_failed} | "
+          f"süpürme bulundu={sweep_found} | bölge bulundu={zone_found}")
 
 
 
