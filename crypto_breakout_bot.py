@@ -301,7 +301,11 @@ SQUEEZE_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "squeeze_posi
 # hafta veri biriktirip skorun fiyatla gercekten iliskili olup olmadigina
 # bakmak - iliski KANITLANMADAN hicbir trading kararina baglanmayacak.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# NOT: eskiden "gemini-2.0-flash" kullaniliyordu - bu model Mart 2026'da
+# resmen kullanimdan kaldirilmis (retired), bu yuzden her cagri hata
+# veriyordu. "gemini-2.5-flash" su an (2026 ortasi) desteklenen, ucretsiz
+# katmanda ~10 istek/dakika, ~250 istek/gun kotasi olan guncel model.
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 RSS_FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -2425,24 +2429,35 @@ def _score_headlines_with_gemini(headlines):
         "yildiz isareti ekleme.\n\nBasliklar:\n"
         + "\n".join(f"- {h}" for h in headlines)
     )
-    try:
-        resp = requests.post(
-            f"{GEMINI_API_URL}?key={GEMINI_API_KEY}",
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        match = re.search(r"-?\d*\.?\d+", text)
-        if not match:
-            print(f"[Duygu] Gemini yanitindan sayi cikarilamadi: {text!r}")
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                f"{GEMINI_API_URL}?key={GEMINI_API_KEY}",
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            match = re.search(r"-?\d*\.?\d+", text)
+            if not match:
+                print(f"[Duygu] Gemini yanitindan sayi cikarilamadi: {text!r}")
+                return None
+            score = float(match.group())
+            return max(-1.0, min(1.0, score))
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status in (429, 500, 502, 503) and attempt < 2:
+                wait_s = 5 * (attempt + 1)
+                print(f"[Duygu] Gemini gecici hata ({status}), {wait_s}sn sonra tekrar denenecek...")
+                time.sleep(wait_s)
+                continue
+            print(f"[Duygu] Gemini cagrisi basarisiz ({e})")
             return None
-        score = float(match.group())
-        return max(-1.0, min(1.0, score))
-    except Exception as e:
-        print(f"[Duygu] Gemini cagrisi basarisiz ({e})")
-        return None
+        except Exception as e:
+            print(f"[Duygu] Gemini cagrisi basarisiz ({e})")
+            return None
+    return None
 
 
 def _log_sentiment_row(score, num_headlines, btc_price):
