@@ -301,11 +301,13 @@ SQUEEZE_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "squeeze_posi
 # hafta veri biriktirip skorun fiyatla gercekten iliskili olup olmadigina
 # bakmak - iliski KANITLANMADAN hicbir trading kararina baglanmayacak.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-# NOT: eskiden "gemini-2.0-flash" kullaniliyordu - bu model Mart 2026'da
-# resmen kullanimdan kaldirilmis (retired), bu yuzden her cagri hata
-# veriyordu. "gemini-2.5-flash" su an (2026 ortasi) desteklenen, ucretsiz
-# katmanda ~10 istek/dakika, ~250 istek/gun kotasi olan guncel model.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+# NOT: modeller cok sik emekliye ayriliyor (2.0-flash Mart 2026'da kalkti,
+# sonra denedigimiz 2.5-flash de 404 verdi - muhtemelen o da degisim
+# surecindeydi). Sabit bir surum yerine Google'in KENDI otomatik
+# guncelledigi "gemini-flash-latest" takma adini kullaniyoruz - Google
+# yeni bir Flash modeli cikardikca bu ad otomatik ona isaret ediyor,
+# boylece birkac ay sonra tekrar 404 almayiz.
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 RSS_FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
