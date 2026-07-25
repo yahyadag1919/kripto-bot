@@ -1406,9 +1406,8 @@ def scan_squeeze_once():
                 print(f"{symbol} (Sıkışma) hata: {e}")
 
 
-
+def score_orderbook(symbol: str, direction: str):
     try:
-        ob = exchange.fetch_order_book(symbol, limit=20)
         bid_vol = sum(b[1] for b in ob["bids"])
         ask_vol = sum(a[1] for a in ob["asks"])
         if ask_vol == 0 or bid_vol == 0:
@@ -2393,6 +2392,7 @@ def scan_smc_once():
 
 
 
+def _fetch_recent_headlines(limit=15):
     """CoinDesk/CoinTelegraph RSS'lerinden son haber basliklarini ceker.
     Basit XML parse - ek kutuphane gerektirmiyor (stdlib xml.etree)."""
     headlines = []
