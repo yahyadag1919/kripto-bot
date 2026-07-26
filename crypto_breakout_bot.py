@@ -322,6 +322,15 @@ SQUEEZE_REVERSAL_EXIT_CANDLES = int(os.environ.get("SQUEEZE_REVERSAL_EXIT_CANDLE
 # demo-fapi guvenilirlik sorunu yuzunden; bunun yerine bolgeyi kendi
 # kaydimizda tutup her turda fiyati kontrol ediyoruz).
 SMC_MODE = os.environ.get("SMC_MODE", "false").lower() == "true"
+
+# ACIL DURUM KILIT ANAHTARI (2026-07-26, Gemini'nin talebi uzerine): TRUE
+# oldugunda hicbir YENI pozisyon acilmiyor - ama ACIK pozisyonlarin trailing
+# stop/koruma takibi (update_*_trailing_stops) NORMAL calismaya devam ediyor.
+# Boyle olmasinin sebebi: artik borsaya hic stop emri koymuyoruz, koruma
+# TAMAMEN botun kendi tarama dongusune bagli - botun tamamini durdurmak,
+# acik pozisyonlari sifir korumayla ortada birakirdi. Yeniden acmak icin
+# Railway'de NEW_TRADES_HALTED=false yapip redeploy et.
+NEW_TRADES_HALTED = os.environ.get("NEW_TRADES_HALTED", "true").lower() == "true"
 SMC_TIMEFRAME = os.environ.get("SMC_TIMEFRAME", "15m")
 SMC_SWEEP_LOOKBACK = int(os.environ.get("SMC_SWEEP_LOOKBACK", "20"))          # X = son 20 mum
 SMC_SWEEP_WICK_ATR_MULT = float(os.environ.get("SMC_SWEEP_WICK_ATR_MULT", "0.3"))
@@ -2711,25 +2720,31 @@ def scan_once():
         # Balina/SMC modu digerlerinin (VWAP/Hacim/Donchian/Sikisma) ONUNE
         # gecer - Gemini ile netlestirilen plan geregi.
         update_smc_trailing_stops()
-        scan_smc_once()
+        if not NEW_TRADES_HALTED:
+            scan_smc_once()
         return
 
     if SQUEEZE_MODE:
         # Sikisma+Kirilim modu digerlerinin (VWAP/Hacim/Donchian) ONUNE gecer -
         # test edilmeden dogrudan canlida denenmesi istendi.
         update_squeeze_trailing_stops()
-        scan_squeeze_once()
+        if not NEW_TRADES_HALTED:
+            scan_squeeze_once()
         return
 
     if DONCHIAN_MODE:
         # VWAP/Hacim Z-Skor sinyalleri bu modda DEVRE DISI - kullanicinin
         # istegiyle sadece Donchian trend-takip (orijinal yon) calisiyor.
         update_donchian_trailing_stops()
-        process_donchian_pending_signals()
-        scan_donchian_once()
+        if not NEW_TRADES_HALTED:
+            process_donchian_pending_signals()
+            scan_donchian_once()
         return
 
     check_pending_outcomes()
+
+    if NEW_TRADES_HALTED:
+        return
 
     # Ayni coin'de zaten acik/bekleyen bir pozisyon varsa tekrar sinyal
     # uretip ustune emir yigmamak icin - Open Orders'in sismesinin asil sebebi buydu.
