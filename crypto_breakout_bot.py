@@ -2912,6 +2912,11 @@ def run_forever():
     else:
         mode_text = "Sadece sinyal modu — otomatik işlem kapalı."
 
+    if NEW_TRADES_HALTED:
+        mode_text += ("\n\n🛑 YENİ İŞLEM AÇMA YASAĞI AKTİF (NEW_TRADES_HALTED=true) — "
+                       "hiçbir yeni pozisyon açılmayacak, sadece mevcut açık pozisyonlar "
+                       "korunmaya/izlenmeye devam edecek.")
+
     recovered = [r for r in _read_pending() if r.get("closed", "0") != "1"]
     persistence_note = (
         f"💾 Kalıcı depolama AKTİF (DATA_DIR={DATA_DIR}) — yeniden başlatmada "
