@@ -364,6 +364,28 @@ SQUEEZE_RISK_PER_TRADE_PCT = float(os.environ.get("SQUEEZE_RISK_PER_TRADE_PCT", 
 SQUEEZE_POSITION_PCT_OF_BALANCE = float(os.environ.get("SQUEEZE_POSITION_PCT_OF_BALANCE", "20"))
 SQUEEZE_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "squeeze_positions.csv")
 
+# --- YENI STRATEJI (2026-07-27, Gemini): "MULTI-TIMEFRAME TREND-PULLBACK"
+# Kirilim/SMC kovalayan sistemler rafa kalkti - artik H1'de net trend teyidi
+# olan coinlerde, M15'te ortalamaya geri cekilme (pullback) ile giriliyor.
+TREND_PULLBACK_MODE = os.environ.get("TREND_PULLBACK_MODE", "false").lower() == "true"
+TP_H1_TIMEFRAME = os.environ.get("TP_H1_TIMEFRAME", "1h")
+TP_M15_TIMEFRAME = os.environ.get("TP_M15_TIMEFRAME", "15m")
+TP_EMA200_PERIOD = int(os.environ.get("TP_EMA200_PERIOD", "200"))
+TP_SUPERTREND_PERIOD = int(os.environ.get("TP_SUPERTREND_PERIOD", "10"))
+TP_SUPERTREND_MULT = float(os.environ.get("TP_SUPERTREND_MULT", "3.0"))
+TP_EMA_FAST = int(os.environ.get("TP_EMA_FAST", "20"))
+TP_EMA_SLOW = int(os.environ.get("TP_EMA_SLOW", "50"))
+TP_RSI_PERIOD = int(os.environ.get("TP_RSI_PERIOD", "14"))
+TP_RSI_LONG_MAX = float(os.environ.get("TP_RSI_LONG_MAX", "45"))
+TP_RSI_SHORT_MIN = float(os.environ.get("TP_RSI_SHORT_MIN", "55"))
+TP_PULLBACK_TOLERANCE_PCT = float(os.environ.get("TP_PULLBACK_TOLERANCE_PCT", "0.3"))  # EMA20/50'ye "dokundu" sayilmasi icin tolerans
+TP_SWING_LOOKBACK = int(os.environ.get("TP_SWING_LOOKBACK", "20"))  # stop icin M15 swing high/low penceresi
+TP_LEVERAGE = int(os.environ.get("TP_LEVERAGE", "10"))  # Gemini: "maks 10x" - genel LEVERAGE'dan BAGIMSIZ, bu mod icin sabit tavan
+TP_RISK_PER_TRADE_PCT = float(os.environ.get("TP_RISK_PER_TRADE_PCT", "2.0"))
+TP_REFERENCE_BALANCE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "tp_reference_balance.txt")
+TP_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "tp_positions.csv")
+TP_FIELDNAMES = ["symbol", "direction", "entry_price", "stop_price", "extreme_price", "entry_time", "against_count", "exchange_stop_order_id"]
+
 # --- 1. KATMAN: Haber & Duygu Analizi (SADECE GOZLEM - hicbir islemi
 # etkilemiyor). CoinDesk/CoinTelegraph RSS'lerinden son haber basliklarini
 # cekip Google Gemini API'sine (ucretsiz katman) gonderip -1..+1 arasi bir
@@ -460,9 +482,9 @@ def send_telegram_confirm(text: str, confirm_id: str):
 # Yari-otomatik islem yurutme (Binance Futures)
 # ---------------------------------------------------------------------------
 
-def _set_leverage_safe(symbol: str):
+def _set_leverage_safe(symbol: str, leverage_override: int = None):
     try:
-        exchange.set_leverage(LEVERAGE, symbol)
+        exchange.set_leverage(leverage_override or LEVERAGE, symbol)
     except Exception as e:
         print(f"Kaldirac ayarlama hatasi ({symbol}): {e}")
 
@@ -2113,6 +2135,327 @@ def cleanup_orphaned_orders():
         print(f"{sym}: takip edilmeyen {len(orders)} basibos emir temizlendi")
 
 
+def _compute_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close = (df["low"] - df["close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def _compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def _compute_supertrend(df: pd.DataFrame, period: int, mult: float) -> pd.Series:
+    """Standart Supertrend: donen deger her mum icin 'YESIL'/'KIRMIZI'."""
+    atr = _compute_atr(df, period)
+    hl2 = (df["high"] + df["low"]) / 2
+    upper_band = hl2 + mult * atr
+    lower_band = hl2 - mult * atr
+
+    direction = pd.Series(index=df.index, dtype=object)
+    final_upper = upper_band.copy()
+    final_lower = lower_band.copy()
+
+    for i in range(1, len(df)):
+        if pd.isna(atr.iloc[i]):
+            direction.iloc[i] = None
+            continue
+        if df["close"].iloc[i - 1] <= final_upper.iloc[i - 1]:
+            final_upper.iloc[i] = min(upper_band.iloc[i], final_upper.iloc[i - 1])
+        else:
+            final_upper.iloc[i] = upper_band.iloc[i]
+        if df["close"].iloc[i - 1] >= final_lower.iloc[i - 1]:
+            final_lower.iloc[i] = max(lower_band.iloc[i], final_lower.iloc[i - 1])
+        else:
+            final_lower.iloc[i] = lower_band.iloc[i]
+
+        if df["close"].iloc[i] > final_upper.iloc[i - 1]:
+            direction.iloc[i] = "YESIL"
+        elif df["close"].iloc[i] < final_lower.iloc[i - 1]:
+            direction.iloc[i] = "KIRMIZI"
+        else:
+            direction.iloc[i] = direction.iloc[i - 1] if i > 0 else None
+    return direction
+
+
+def fetch_tp_df(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    return df
+
+
+def get_h1_trend_bias(symbol: str):
+    """H1: Fiyat>EMA200 VE Supertrend=YESIL -> LONG. Fiyat<EMA200 VE
+    Supertrend=KIRMIZI -> SHORT. Net degilse None (bu coinde islem YOK)."""
+    try:
+        df = fetch_tp_df(symbol, TP_H1_TIMEFRAME, TP_EMA200_PERIOD + 50)
+    except Exception:
+        return None
+    if len(df) < TP_EMA200_PERIOD + 5:
+        return None
+    df["ema200"] = df["close"].ewm(span=TP_EMA200_PERIOD, adjust=False).mean()
+    df["supertrend"] = _compute_supertrend(df, TP_SUPERTREND_PERIOD, TP_SUPERTREND_MULT)
+    row = df.iloc[-2]  # son kapanan H1 mum
+    if pd.isna(row["ema200"]) or row["supertrend"] is None:
+        return None
+    if row["close"] > row["ema200"] and row["supertrend"] == "YESIL":
+        return "LONG"
+    if row["close"] < row["ema200"] and row["supertrend"] == "KIRMIZI":
+        return "SHORT"
+    return None
+
+
+def detect_pullback_entry(symbol: str, bias: str):
+    """M15: EMA20/EMA50'ye pullback + RSI filtresi + onay mumu (yesil/kirmizi
+    govde). Bulunursa (entry_price, atr14, swing_stop) dondurur, yoksa None."""
+    try:
+        df = fetch_tp_df(symbol, TP_M15_TIMEFRAME, max(TP_EMA_SLOW, TP_SWING_LOOKBACK) + 50)
+    except Exception:
+        return None
+    if len(df) < TP_EMA_SLOW + 5:
+        return None
+    df["ema_fast"] = df["close"].ewm(span=TP_EMA_FAST, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=TP_EMA_SLOW, adjust=False).mean()
+    df["rsi"] = _compute_rsi(df["close"], TP_RSI_PERIOD)
+    df["atr14"] = _compute_atr(df, ATR_PERIOD)
+
+    row = df.iloc[-2]  # onay mumu adayi (son kapanan M15 mum)
+    if pd.isna(row["ema_fast"]) or pd.isna(row["ema_slow"]) or pd.isna(row["rsi"]) or pd.isna(row["atr14"]):
+        return None
+
+    tol = row["close"] * (TP_PULLBACK_TOLERANCE_PCT / 100)
+    touched_fast = abs(row["low"] - row["ema_fast"]) <= tol or abs(row["high"] - row["ema_fast"]) <= tol
+    touched_slow = abs(row["low"] - row["ema_slow"]) <= tol or abs(row["high"] - row["ema_slow"]) <= tol
+    touched_ema = touched_fast or touched_slow
+
+    if bias == "LONG":
+        confirm_candle = row["close"] > row["open"]  # yesil govde
+        rsi_ok = row["rsi"] < TP_RSI_LONG_MAX
+        if touched_ema and rsi_ok and confirm_candle:
+            swing_low = df.iloc[-2 - TP_SWING_LOOKBACK:-2]["low"].min()
+            return row["close"], row["atr14"], swing_low
+    else:
+        confirm_candle = row["close"] < row["open"]  # kirmizi govde
+        rsi_ok = row["rsi"] > TP_RSI_SHORT_MIN
+        if touched_ema and rsi_ok and confirm_candle:
+            swing_high = df.iloc[-2 - TP_SWING_LOOKBACK:-2]["high"].max()
+            return row["close"], row["atr14"], swing_high
+    return None
+
+
+def _get_tp_reference_balance():
+    env_override = os.environ.get("TP_REFERENCE_BALANCE")
+    if env_override:
+        return float(env_override)
+    if os.path.isfile(TP_REFERENCE_BALANCE_FILE):
+        with open(TP_REFERENCE_BALANCE_FILE) as f:
+            return float(f.read().strip())
+    balance = exchange.fetch_balance()
+    free_usdt = balance.get("USDT", {}).get("free") or balance.get("free", {}).get("USDT") or 0
+    with open(TP_REFERENCE_BALANCE_FILE, "w") as f:
+        f.write(str(free_usdt))
+    return float(free_usdt)
+
+
+def _compute_tp_position_size(symbol: str, entry_price: float, stop_price: float) -> float:
+    reference_balance = _get_tp_reference_balance()
+    risk_amount = reference_balance * (TP_RISK_PER_TRADE_PCT / 100)
+    stop_distance = abs(entry_price - stop_price)
+    if stop_distance <= 0:
+        return 0
+    qty = risk_amount / stop_distance
+    try:
+        qty = float(exchange.amount_to_precision(symbol, qty))
+    except Exception:
+        pass
+    return qty
+
+
+def _read_tp_positions():
+    if not os.path.isfile(TP_STATE_FILE):
+        return []
+    with open(TP_STATE_FILE, newline="") as f:
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        r.setdefault("against_count", "0")
+        r.setdefault("exchange_stop_order_id", "")
+    return rows
+
+
+def _write_tp_positions(rows):
+    with open(TP_STATE_FILE, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TP_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def open_trend_pullback_position(symbol: str, direction: str, entry_price: float, atr14: float, swing_stop: float):
+    """Gemini'nin ACIKCA istedigi guvenlik zorunlulugu: islem acilir acilmaz
+    borsaya GERCEK Stop-Market emri koyulur (M15 swing high/low seviyesinde).
+    EK GUVENLIK (Claude'un eklemesi): bu emrin varligi/eksikligi HER TURDA
+    ayrica yazilimsal olarak da kontrol edilir (update_tp_positions) - demo-fapi
+    ortaminda borsa emirlerinin sessizce kaybolabildigini onceki debug
+    sürecinde kanitlamistik, bu yuzden TEK BASINA borsa emrine guvenmiyoruz."""
+    _set_leverage_safe(symbol, leverage_override=TP_LEVERAGE)
+    side = "buy" if direction == "LONG" else "sell"
+
+    stop_price = swing_stop
+    qty = _compute_tp_position_size(symbol, entry_price, stop_price)
+    if qty <= 0:
+        return None
+
+    order = exchange.create_order(symbol, type="market", side=side, amount=qty)
+    real_entry_price = order.get("average") or order.get("price")
+    if not real_entry_price:
+        try:
+            real_entry_price = exchange.fetch_ticker(symbol)["last"]
+        except Exception:
+            real_entry_price = entry_price
+
+    stop_order_id = ""
+    stop_side = "sell" if direction == "LONG" else "buy"
+    try:
+        stop_order = exchange.create_order(
+            symbol, type="STOP_MARKET", side=stop_side, amount=qty,
+            params={"stopPrice": stop_price, "reduceOnly": True},
+        )
+        stop_order_id = stop_order.get("id", "")
+    except Exception as e:
+        print(f"{symbol} (Trend-Pullback): borsa stop emri konulamadi ({e}) - YAZILIMSAL yedek devrede olacak")
+
+    rows = _read_tp_positions()
+    rows.append({
+        "symbol": symbol, "direction": direction,
+        "entry_price": real_entry_price, "stop_price": stop_price, "extreme_price": real_entry_price,
+        "entry_time": datetime.now().isoformat(), "against_count": "0",
+        "exchange_stop_order_id": stop_order_id,
+    })
+    _write_tp_positions(rows)
+
+    send_telegram_message(
+        f"📈 [Trend-Pullback] {symbol} {direction} pozisyon açıldı (H1 trend + M15 pullback).\n"
+        f"Giriş: {real_entry_price:.6f} | Stop (M15 swing): {stop_price:.6f}\n"
+        f"{'✅ Borsa stop emri aktif' if stop_order_id else '⚠️ Borsa stop KONULAMADI, sadece yazılımsal koruma aktif'}\n"
+        f"Kaldıraç: {TP_LEVERAGE}x | Risk: %{TP_RISK_PER_TRADE_PCT}"
+    )
+    return qty
+
+
+def update_tp_positions():
+    """Her turda IKI kontrol de yapilir: (1) borsa stop emri hala var mi -
+    yoksa yeniden koy; (2) yazilimsal fiyat kontrolu - stop seviyesi
+    gecildiyse (borsa emri her nedense tetiklenmemis olsa bile) HEMEN kapat."""
+    rows = _read_tp_positions()
+    if not rows:
+        return
+    still_open = []
+    for r in rows:
+        symbol = r["symbol"]
+        direction = r["direction"]
+        entry_price = float(r["entry_price"])
+        stop_price = float(r["stop_price"])
+        stop_order_id = r.get("exchange_stop_order_id", "")
+
+        try:
+            positions = exchange.fetch_positions([symbol])
+            live_qty = 0
+            for p in positions:
+                if abs(p.get("contracts") or 0) > 0:
+                    live_qty = abs(p["contracts"])
+                    break
+        except Exception as e:
+            print(f"{symbol} (Trend-Pullback): pozisyon kontrolu basarisiz ({e})")
+            still_open.append(r)
+            continue
+
+        if live_qty == 0:
+            # Pozisyon kapanmis (borsa stop'u tetiklenmis olabilir) - kayittan dus.
+            continue
+
+        # (1) Borsa stop emri hala duruyor mu kontrol et, yoksa yeniden koy.
+        try:
+            open_orders = exchange.fetch_open_orders(symbol)
+            has_stop = any(o.get("id") == stop_order_id for o in open_orders) if stop_order_id else False
+            if not has_stop:
+                stop_side = "sell" if direction == "LONG" else "buy"
+                new_stop_order = exchange.create_order(
+                    symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
+                    params={"stopPrice": stop_price, "reduceOnly": True},
+                )
+                r["exchange_stop_order_id"] = new_stop_order.get("id", "")
+                send_telegram_message(f"🛡️ [Trend-Pullback] {symbol}: borsa stop emri bulunamadı, yeniden koyuldu.")
+        except Exception as e:
+            print(f"{symbol} (Trend-Pullback): borsa stop kontrolu basarisiz ({e})")
+
+        # (2) YAZILIMSAL yedek - borsa emri her nedense sessizce basarisiz
+        # olsa/tetiklenmese bile, guncel fiyat stop seviyesini gectiyse HEMEN kapat.
+        try:
+            price = exchange.fetch_ticker(symbol)["last"]
+        except Exception:
+            still_open.append(r)
+            continue
+
+        breached = (price <= stop_price) if direction == "LONG" else (price >= stop_price)
+        if breached:
+            close_err = _close_position(symbol, direction, live_qty)
+            raw_pct = (price - entry_price) / entry_price * 100
+            pct_change = raw_pct if direction == "LONG" else -raw_pct
+            if not close_err:
+                log_closed_trade(symbol, "Trend-Pullback", direction, entry_price, price, pct_change, "SL")
+                send_telegram_message(
+                    f"📉 [Trend-Pullback] {symbol} {direction} pozisyon stop'a takıldı. "
+                    f"Giriş: {entry_price:.6f} | Çıkış: {price:.6f} | Değişim: {pct_change:+.2f}%"
+                )
+            else:
+                still_open.append(r)
+            continue
+
+        still_open.append(r)
+
+    _write_tp_positions(still_open)
+
+
+def scan_trend_pullback_once():
+    open_symbols = {r["symbol"] for r in _read_tp_positions()}
+    if len(open_symbols) >= MAX_OPEN_POSITIONS:
+        return
+    scanned = 0
+    trend_found = 0
+    entries = 0
+    for symbol in WATCHLIST:
+        if symbol in open_symbols:
+            continue
+        if len(open_symbols) >= MAX_OPEN_POSITIONS:
+            break
+        scanned += 1
+        try:
+            bias = get_h1_trend_bias(symbol)
+            if bias is None:
+                continue
+            trend_found += 1
+            result = detect_pullback_entry(symbol, bias)
+            if result is None:
+                continue
+            entry_price, atr14, swing_stop = result
+            opened_qty = open_trend_pullback_position(symbol, bias, entry_price, atr14, swing_stop)
+            if opened_qty:
+                entries += 1
+                open_symbols.add(symbol)
+        except Exception as e:
+            print(f"[Trend-Pullback] {symbol}: hata ({e})")
+
+    print(f"[Trend-Pullback] Tur özeti: taranan={scanned} | H1 trend bulundu={trend_found} | açılan={entries}")
+
+
 def fetch_smc_ohlcv_df(symbol: str, limit: int = 100) -> pd.DataFrame:
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=SMC_TIMEFRAME, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -2715,6 +3058,15 @@ def scan_once():
             cleanup_duplicate_stop_orders()
         except Exception as e:
             print(f"Fazladan emir temizligi basarisiz ({e})")
+
+    if TREND_PULLBACK_MODE:
+        # "MULTI-TIMEFRAME TREND-PULLBACK" digerlerinin (Balina/SMC/Sikisma/
+        # Donchian/VWAP) ONUNE gecer - Gemini'nin 2026-07-27 tarihli plani
+        # geregi, kirilim kovalayan sistemler rafa kalkti.
+        update_tp_positions()
+        if not NEW_TRADES_HALTED:
+            scan_trend_pullback_once()
+        return
 
     if SMC_MODE:
         # Balina/SMC modu digerlerinin (VWAP/Hacim/Donchian/Sikisma) ONUNE
