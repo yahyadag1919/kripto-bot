@@ -178,6 +178,22 @@ if USE_TESTNET:
     except Exception:
         pass
 
+# WATCHLIST'teki bazi coinler bu hesapta/ortamda hic mevcut olmayabilir
+# (orn. ICP, PEPE, SHIB - "does not have market symbol" hatasi verip her
+# turda bosuna zaman/log harciyordu). Baslarken GERCEK piyasa listesini
+# cekip WATCHLIST'i otomatik olarak sadece var olan sembollerle sinirliyoruz -
+# boylece bu tur hatalar bir daha hic cikmaz, listeyi elle duzenlemeye gerek
+# kalmaz.
+try:
+    exchange.load_markets()
+    _valid_watchlist = [s for s in WATCHLIST if s in exchange.markets]
+    _dropped = [s for s in WATCHLIST if s not in exchange.markets]
+    if _dropped:
+        print(f"WATCHLIST temizlendi: {len(_dropped)} sembol bu hesapta yok, cikarildi: {', '.join(_dropped)}")
+    WATCHLIST = _valid_watchlist
+except Exception as e:
+    print(f"Piyasa listesi dogrulanamadi ({e}), WATCHLIST oldugu gibi kullanilacak")
+
 # Otomatik islem ayarlari
 AUTO_TRADING_ENABLED = os.environ.get("AUTO_TRADING_ENABLED", "false").lower() == "true"
 FULL_AUTO_TRADING = os.environ.get("FULL_AUTO_TRADING", "false").lower() == "true"
@@ -289,12 +305,12 @@ SQUEEZE_REVERSAL_EXIT_CANDLES = int(os.environ.get("SQUEEZE_REVERSAL_EXIT_CANDLE
 SMC_MODE = os.environ.get("SMC_MODE", "false").lower() == "true"
 SMC_TIMEFRAME = os.environ.get("SMC_TIMEFRAME", "15m")
 SMC_SWEEP_LOOKBACK = int(os.environ.get("SMC_SWEEP_LOOKBACK", "20"))          # X = son 20 mum
-SMC_SWEEP_WICK_ATR_MULT = float(os.environ.get("SMC_SWEEP_WICK_ATR_MULT", "0.5"))
-SMC_OB_CONFIRM_CANDLES = int(os.environ.get("SMC_OB_CONFIRM_CANDLES", "2"))   # N = sonraki 1-2 mum
+SMC_SWEEP_WICK_ATR_MULT = float(os.environ.get("SMC_SWEEP_WICK_ATR_MULT", "0.3"))
+SMC_OB_CONFIRM_CANDLES = int(os.environ.get("SMC_OB_CONFIRM_CANDLES", "3"))   # N = sonraki 3 mum
 SMC_OB_BODY_ATR_MULT = float(os.environ.get("SMC_OB_BODY_ATR_MULT", "2.0"))
 SMC_FVG_MIN_ATR_MULT = float(os.environ.get("SMC_FVG_MIN_ATR_MULT", "1.0"))
 SMC_FVG_MIN_PCT = float(os.environ.get("SMC_FVG_MIN_PCT", "0.3"))            # yuzde
-SMC_ZONE_SEARCH_CANDLES = int(os.environ.get("SMC_ZONE_SEARCH_CANDLES", "8"))  # supurmeden sonra kac mum icinde OB/FVG aranir
+SMC_ZONE_SEARCH_CANDLES = int(os.environ.get("SMC_ZONE_SEARCH_CANDLES", "12"))  # supurmeden sonra kac mum icinde OB/FVG aranir
 SMC_ZONE_WAIT_CANDLES = int(os.environ.get("SMC_ZONE_WAIT_CANDLES", "10"))   # bolge bulundu, fiyat gelmezse kac mumda vazgecilir
 SMC_SENTIMENT_THRESHOLD = float(os.environ.get("SMC_SENTIMENT_THRESHOLD", "0.2"))
 SMC_INITIAL_STOP_ATR_MULT = float(os.environ.get("SMC_INITIAL_STOP_ATR_MULT", "1.5"))
