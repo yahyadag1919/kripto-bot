@@ -308,6 +308,7 @@ SQUEEZE_BBW_LOOKBACK = int(os.environ.get("SQUEEZE_BBW_LOOKBACK", "100"))  # sik
 SQUEEZE_PERCENTILE = float(os.environ.get("SQUEEZE_PERCENTILE", "0.20"))  # BBW bu yuzdelik dilimin altindaysa "sikisma"
 SQUEEZE_WINDOW = int(os.environ.get("SQUEEZE_WINDOW", "20"))  # kirilim seviyesi bu kadar mumun en yuksek/dusugu
 SQUEEZE_STRONG_BODY_MULT = float(os.environ.get("SQUEEZE_STRONG_BODY_MULT", "1.5"))
+SQUEEZE_VOLUME_MULT = float(os.environ.get("SQUEEZE_VOLUME_MULT", "1.5"))  # kirilim mumu, ortalama hacmin bu katindan fazla olmali
 SQUEEZE_BODY_AVG_WINDOW = int(os.environ.get("SQUEEZE_BODY_AVG_WINDOW", "20"))
 SQUEEZE_ATR_STOP_MULT = float(os.environ.get("SQUEEZE_ATR_STOP_MULT", "2.0"))  # ilk stop mesafesi = ATR14 * bu katsayi
 SQUEEZE_REVERSAL_EXIT_CANDLES = int(os.environ.get("SQUEEZE_REVERSAL_EXIT_CANDLES", "6"))
@@ -1206,6 +1207,7 @@ def compute_squeeze_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["squeeze_low"] = df["low"].shift(1).rolling(SQUEEZE_WINDOW).min()
     df["body"] = (df["close"] - df["open"]).abs()
     df["avg_body20"] = df["body"].rolling(SQUEEZE_BODY_AVG_WINDOW).mean()
+    df["avg_volume20"] = df["volume"].rolling(SQUEEZE_BODY_AVG_WINDOW).mean()
 
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
@@ -1216,19 +1218,21 @@ def compute_squeeze_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def check_squeeze_gate(df: pd.DataFrame):
-    """Bir onceki mum SIKISMADAYDI, simdiki mum GUCLU govdeyle sikisma araligini
-    kiriyorsa -> kirilim yonunde sinyal (dogrudan bu yonde islem acilir, TERS
-    CEVRILMEZ - kullanicinin gozlemledigi orneğe uygun)."""
+    """"VOLATİLİTE SIKIŞMASI & MOMENTUM BREAKOUT" (2026-07-26, Gemini'nin
+    SMC'nin yerine gecen yeni stratejisi): bir onceki mum SIKISMADAYDI, simdiki
+    mum GUCLU govdeyle VE YUKSEK HACIMLE sikisma araligini kiriyorsa -> kirilim
+    yonunde sinyal (dogrudan bu yonde islem acilir, TERS CEVRILMEZ)."""
     if len(df) < max(SQUEEZE_BBW_LOOKBACK, SQUEEZE_WINDOW, SQUEEZE_BODY_AVG_WINDOW) + 3:
         return None
     prev = df.iloc[-3]
     row = df.iloc[-2]
-    if pd.isna(prev.get("in_squeeze")) or pd.isna(row.get("squeeze_high")) or pd.isna(row.get("avg_body20")) or pd.isna(row.get("atr14")) or row["avg_body20"] == 0:
+    if pd.isna(prev.get("in_squeeze")) or pd.isna(row.get("squeeze_high")) or pd.isna(row.get("avg_body20")) or pd.isna(row.get("avg_volume20")) or pd.isna(row.get("atr14")) or row["avg_body20"] == 0 or row["avg_volume20"] == 0:
         return None
     if not prev["in_squeeze"]:
         return None
     strong_body = row["body"] >= row["avg_body20"] * SQUEEZE_STRONG_BODY_MULT
-    if not strong_body:
+    strong_volume = row["volume"] >= row["avg_volume20"] * SQUEEZE_VOLUME_MULT
+    if not strong_body or not strong_volume:
         return None
     if row["close"] > row["squeeze_high"]:
         return "LONG", row
@@ -1254,9 +1258,11 @@ def _write_squeeze_positions(rows):
         writer.writerows(rows)
 
 
-def _compute_squeeze_position_size(entry_price: float, stop_price: float) -> float:
+def _compute_squeeze_position_size(entry_price: float, stop_price: float, risk_multiplier: float = 1.0) -> float:
     """Donchian'daki bakiye-bazli mantigin ayni - stop'a takilirsa kaybedilen
-    TAM OLARAK referans bakiyenin SQUEEZE_RISK_PER_TRADE_PCT'i olur."""
+    TAM OLARAK referans bakiyenin SQUEEZE_RISK_PER_TRADE_PCT'i olur.
+    risk_multiplier: Gemini'nin yeni stratejisi geregi, Duygu Skoru teknik
+    sinyali destekliyorsa 1.0 (tam risk), notrse 0.5 (yari risk)."""
     reference_balance = get_squeeze_reference_balance()
     balance = exchange.fetch_balance()
     free_usdt = balance.get("USDT", {}).get("free", 0)
@@ -1265,20 +1271,20 @@ def _compute_squeeze_position_size(entry_price: float, stop_price: float) -> flo
     if stop_distance <= 0:
         return 0
 
-    risk_amount = reference_balance * (SQUEEZE_RISK_PER_TRADE_PCT / 100)
+    risk_amount = reference_balance * (SQUEEZE_RISK_PER_TRADE_PCT / 100) * risk_multiplier
     risk_based_qty = risk_amount / stop_distance
 
-    max_notional = min(reference_balance, free_usdt) * (SQUEEZE_POSITION_PCT_OF_BALANCE / 100) * LEVERAGE
+    max_notional = min(reference_balance, free_usdt) * (SQUEEZE_POSITION_PCT_OF_BALANCE / 100) * LEVERAGE * risk_multiplier
     max_qty_by_margin = max_notional / entry_price
 
     return min(risk_based_qty, max_qty_by_margin)
 
 
-def open_squeeze_position(symbol: str, signal_direction: str, entry_price: float, atr14: float):
-    """SINYAL TESPITI (sikisma+kirilim) hic degismiyor - signal_direction parametresi
-    check_squeeze_gate'in urettigi ORIJINAL yondur, DOKUNULMUYOR. Sadece GERCEK ISLEM,
-    SQUEEZE_INVERT_EXECUTION acikken TERS yonde aciliyor - Telegram bildirimi HER ZAMAN
-    sinyalin orijinal yonunu gosterir (Donchian modundakiyle AYNI mantik)."""
+def open_squeeze_position(symbol: str, signal_direction: str, entry_price: float, atr14: float, risk_multiplier: float = 1.0, sentiment_note: str = ""):
+    """SINYAL TESPITI (sikisma+kirilim+hacim) hic degismiyor - signal_direction
+    parametresi check_squeeze_gate'in urettigi ORIJINAL yondur, DOKUNULMUYOR.
+    risk_multiplier: Gemini'nin "Volatilite Sikismasi & Momentum Breakout"
+    stratejisi geregi (2026-07-26) - Duygu Skoru destekliyorsa 1.0, notrse 0.5."""
     trade_direction = (("SHORT" if signal_direction == "LONG" else "LONG")
                         if SQUEEZE_INVERT_EXECUTION else signal_direction)
 
@@ -1287,7 +1293,7 @@ def open_squeeze_position(symbol: str, signal_direction: str, entry_price: float
 
     provisional_stop = (entry_price - atr14 * SQUEEZE_ATR_STOP_MULT if trade_direction == "LONG"
                          else entry_price + atr14 * SQUEEZE_ATR_STOP_MULT)
-    qty = _compute_squeeze_position_size(entry_price, provisional_stop)
+    qty = _compute_squeeze_position_size(entry_price, provisional_stop, risk_multiplier)
     if qty <= 0:
         raise ValueError("Hesaplanan pozisyon miktari sifir veya negatif.")
 
@@ -1315,8 +1321,9 @@ def open_squeeze_position(symbol: str, signal_direction: str, entry_price: float
     _write_squeeze_positions(rows)
 
     send_telegram_message(
-        f"🗜️ [Sıkışma+Kırılım] {symbol} {signal_direction} pozisyon açıldı (sıkışma sonrası güçlü kırılım).\n"
+        f"🗜️ [Sıkışma+Kırılım+Hacim] {symbol} {signal_direction} pozisyon açıldı (sıkışma sonrası hacimli kırılım).\n"
         f"Giriş: {real_entry_price:.6f} | İlk stop: {stop_price:.6f} (ATR×{SQUEEZE_ATR_STOP_MULT})\n"
+        f"Risk: %{SQUEEZE_RISK_PER_TRADE_PCT * risk_multiplier:.1f} ({sentiment_note})\n"
         f"TP YOK — trailing stop kazananın büyümesine izin veriyor."
     )
     return qty
@@ -1441,13 +1448,23 @@ def update_squeeze_trailing_stops():
 
 
 def scan_squeeze_once():
+    """"VOLATİLİTE SIKIŞMASI & MOMENTUM BREAKOUT" (2026-07-26): Duygu Skoru
+    artik yon dayatmiyor, sadece risk buyuklugunu belirliyor - destekliyorsa
+    tam risk (1.0), notrse yari risk (0.5). Teknik sinyal (sikisma+kirilim+
+    hacim) TEK BASINA yeterli, duygu sadece boyutlandirici/filtre."""
     open_symbols = {r["symbol"] for r in _read_squeeze_positions()}
     if len(open_symbols) >= MAX_OPEN_POSITIONS:
         return
 
+    score = get_latest_sentiment_score()
+    scanned = 0
+    breakout_found = 0
+    opened = 0
+
     for symbol in WATCHLIST:
         if symbol in _unsupported_symbols or symbol in open_symbols:
             continue
+        scanned += 1
         try:
             df = fetch_squeeze_ohlcv_df(symbol, limit=SQUEEZE_BBW_LOOKBACK + 30)
             df = compute_squeeze_indicators(df)
@@ -1455,7 +1472,24 @@ def scan_squeeze_once():
             if not result:
                 continue
             direction, row = result
-            open_squeeze_position(symbol, direction, row["close"], row["atr14"])
+            breakout_found += 1
+
+            if score is None:
+                risk_multiplier = 0.5
+                sentiment_note = "duygu verisi yok, %50 risk"
+            elif (direction == "LONG" and score >= SMC_SENTIMENT_THRESHOLD) or \
+                 (direction == "SHORT" and score <= -SMC_SENTIMENT_THRESHOLD):
+                risk_multiplier = 1.0
+                sentiment_note = f"duygu destekliyor ({score:+.2f}), tam risk"
+            elif abs(score) < SMC_SENTIMENT_THRESHOLD:
+                risk_multiplier = 0.5
+                sentiment_note = f"duygu nötr ({score:+.2f}), %50 risk"
+            else:
+                risk_multiplier = 0.5
+                sentiment_note = f"duygu ters yönde ({score:+.2f}) ama teknik sinyal yeterli, %50 risk"
+
+            open_squeeze_position(symbol, direction, row["close"], row["atr14"], risk_multiplier, sentiment_note)
+            opened += 1
             if len(_read_squeeze_positions()) >= MAX_OPEN_POSITIONS:
                 break
         except Exception as e:
@@ -1463,6 +1497,8 @@ def scan_squeeze_once():
                 _unsupported_symbols.add(symbol)
             else:
                 print(f"{symbol} (Sıkışma) hata: {e}")
+
+    print(f"[Sıkışma+Hacim] Tur özeti: taranan={scanned} | kırılım+hacim bulundu={breakout_found} | açılan={opened}")
 
 
 def score_orderbook(symbol: str, direction: str):
