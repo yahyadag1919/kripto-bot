@@ -186,10 +186,28 @@ if USE_TESTNET:
 # kalmaz.
 try:
     exchange.load_markets()
-    _valid_watchlist = [s for s in WATCHLIST if s in exchange.markets]
-    _dropped = [s for s in WATCHLIST if s not in exchange.markets]
+    def _is_tradeable(sym):
+        m = exchange.markets.get(sym)
+        if m is None:
+            return False
+        # "active" alaninin kendisi bazen None/eksik olabiliyor - bu yuzden
+        # SADECE False ise disla, yoksa (True veya bilinmiyor) devam et. Buna
+        # ek olarak Binance'in kendi 'status' bilgisini (info.status) de
+        # kontrol ediyoruz - "TRADING" degilse (orn. BREAK, HALT) disla.
+        # BAL/STMX gibi semboller markets'te VAR ama status'u TRADING degil,
+        # bu yuzden -1122 "Invalid symbol status" hatasi veriyordu - sadece
+        # 'sembol var mi' kontrolu bunu yakalamiyordu.
+        if m.get("active") is False:
+            return False
+        info_status = (m.get("info") or {}).get("status")
+        if info_status and info_status != "TRADING":
+            return False
+        return True
+
+    _valid_watchlist = [s for s in WATCHLIST if _is_tradeable(s)]
+    _dropped = [s for s in WATCHLIST if not _is_tradeable(s)]
     if _dropped:
-        print(f"WATCHLIST temizlendi: {len(_dropped)} sembol bu hesapta yok, cikarildi: {', '.join(_dropped)}")
+        print(f"WATCHLIST temizlendi: {len(_dropped)} sembol bu hesapta yok/aktif degil, cikarildi: {', '.join(_dropped)}")
     WATCHLIST = _valid_watchlist
 except Exception as e:
     print(f"Piyasa listesi dogrulanamadi ({e}), WATCHLIST oldugu gibi kullanilacak")
@@ -2048,8 +2066,11 @@ def detect_sweep_and_confirmation(df: pd.DataFrame):
     OB/FVG bölgesi bekleMEden, süpürmenin hemen ARDINDAN gelen mumda momentum
     teyidi ariyor. df.iloc[-3] = supurme mumu, df.iloc[-2] = teyit mumu (son
     kapanan mum). Teyit: yutan mum (engulfing) VEYA govdesi >= SMC_CONFIRM_BODY_PCT
-    yuzde olan guclu mum. Bulunursa (yon, supurme_mumu, teyit_mumu, atr) dondurur,
-    yoksa None."""
+    yuzde olan guclu mum.
+    Donus degerleri (teshis amacli 3 farkli durum ayirt ediliyor):
+      - None: supurme HIC olusmadi
+      - ("SWEEP_ONLY", yon): supurme oldu AMA sonraki mum teyit etmedi
+      - (yon, supurme_mumu, teyit_mumu, atr): TAM eslesme, giris sinyali"""
     if len(df) < SMC_SWEEP_LOOKBACK + 4:
         return None
     sweep_candle = df.iloc[-3]
@@ -2072,6 +2093,7 @@ def detect_sweep_and_confirmation(df: pd.DataFrame):
         is_strong_green = confirm_candle["close"] > confirm_candle["open"] and body_pct >= SMC_CONFIRM_BODY_PCT
         if is_engulfing or is_strong_green:
             return "LONG", sweep_candle, confirm_candle, atr
+        return "SWEEP_ONLY", "LONG"
 
     if bearish_sweep:
         is_engulfing = confirm_candle["close"] < sweep_candle["open"] and confirm_candle["open"] > sweep_candle["close"]
@@ -2079,6 +2101,7 @@ def detect_sweep_and_confirmation(df: pd.DataFrame):
         is_strong_red = confirm_candle["close"] < confirm_candle["open"] and body_pct >= SMC_CONFIRM_BODY_PCT
         if is_engulfing or is_strong_red:
             return "SHORT", sweep_candle, confirm_candle, atr
+        return "SWEEP_ONLY", "SHORT"
 
     return None
 
@@ -2426,6 +2449,7 @@ def scan_smc_once():
 
     scanned = 0
     fetch_failed = 0
+    sweep_only = 0
     confirmed = 0
     opened = 0
     vetoed = 0
@@ -2446,6 +2470,9 @@ def scan_smc_once():
 
         result = detect_sweep_and_confirmation(df)
         if result is None:
+            continue
+        if result[0] == "SWEEP_ONLY":
+            sweep_only += 1
             continue
         confirmed += 1
         direction, sweep_candle, confirm_candle, atr14 = result
@@ -2474,7 +2501,7 @@ def scan_smc_once():
             print(f"[Balina/SMC] {symbol}: giris basarisiz ({e})")
 
     print(f"[Balina/SMC] Tur özeti (Flip&Go): taranan={scanned} | veri hatası={fetch_failed} | "
-          f"teyit bulundu={confirmed} | duygu veto={vetoed} | açılan={opened}")
+          f"sadece süpürme (teyit gelmedi)={sweep_only} | tam teyit={confirmed} | duygu veto={vetoed} | açılan={opened}")
 
 
 
