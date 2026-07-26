@@ -310,8 +310,9 @@ SMC_OB_CONFIRM_CANDLES = int(os.environ.get("SMC_OB_CONFIRM_CANDLES", "3"))   # 
 SMC_OB_BODY_ATR_MULT = float(os.environ.get("SMC_OB_BODY_ATR_MULT", "2.0"))
 SMC_FVG_MIN_ATR_MULT = float(os.environ.get("SMC_FVG_MIN_ATR_MULT", "1.0"))
 SMC_FVG_MIN_PCT = float(os.environ.get("SMC_FVG_MIN_PCT", "0.3"))            # yuzde
-SMC_ZONE_SEARCH_CANDLES = int(os.environ.get("SMC_ZONE_SEARCH_CANDLES", "12"))  # supurmeden sonra kac mum icinde OB/FVG aranir
-SMC_ZONE_WAIT_CANDLES = int(os.environ.get("SMC_ZONE_WAIT_CANDLES", "10"))   # bolge bulundu, fiyat gelmezse kac mumda vazgecilir
+SMC_ZONE_SEARCH_CANDLES = int(os.environ.get("SMC_ZONE_SEARCH_CANDLES", "12"))  # ESKI akista kullanildi (OB/FVG), Flip&Go'da kullanilmiyor
+SMC_ZONE_WAIT_CANDLES = int(os.environ.get("SMC_ZONE_WAIT_CANDLES", "10"))   # ESKI akista kullanildi, Flip&Go'da kullanilmiyor
+SMC_CONFIRM_BODY_PCT = float(os.environ.get("SMC_CONFIRM_BODY_PCT", "0.5"))  # "FLIP & GO": supurmeden sonraki mum en az bu kadar govdeli VEYA yutan (engulfing) mum olmali
 SMC_SENTIMENT_THRESHOLD = float(os.environ.get("SMC_SENTIMENT_THRESHOLD", "0.2"))
 SMC_INITIAL_STOP_ATR_MULT = float(os.environ.get("SMC_INITIAL_STOP_ATR_MULT", "1.5"))
 SMC_TRAIL_ATR_MULT = float(os.environ.get("SMC_TRAIL_ATR_MULT", "2.5"))
@@ -2042,6 +2043,46 @@ def fetch_smc_ohlcv_df(symbol: str, limit: int = 100) -> pd.DataFrame:
     return df
 
 
+def detect_sweep_and_confirmation(df: pd.DataFrame):
+    """"FLIP & GO" (2026-07-26, Gemini'nin sadeleştirilmiş stratejisi):
+    OB/FVG bölgesi bekleMEden, süpürmenin hemen ARDINDAN gelen mumda momentum
+    teyidi ariyor. df.iloc[-3] = supurme mumu, df.iloc[-2] = teyit mumu (son
+    kapanan mum). Teyit: yutan mum (engulfing) VEYA govdesi >= SMC_CONFIRM_BODY_PCT
+    yuzde olan guclu mum. Bulunursa (yon, supurme_mumu, teyit_mumu, atr) dondurur,
+    yoksa None."""
+    if len(df) < SMC_SWEEP_LOOKBACK + 4:
+        return None
+    sweep_candle = df.iloc[-3]
+    confirm_candle = df.iloc[-2]
+    atr = sweep_candle["atr14"]
+    if pd.isna(atr):
+        return None
+    ref_window = df.iloc[-3 - SMC_SWEEP_LOOKBACK:-3]
+    swing_low = ref_window["low"].min()
+    swing_high = ref_window["high"].max()
+
+    bullish_sweep = (sweep_candle["low"] < swing_low and sweep_candle["close"] > swing_low
+                      and (swing_low - sweep_candle["low"]) >= SMC_SWEEP_WICK_ATR_MULT * atr)
+    bearish_sweep = (sweep_candle["high"] > swing_high and sweep_candle["close"] < swing_high
+                      and (sweep_candle["high"] - swing_high) >= SMC_SWEEP_WICK_ATR_MULT * atr)
+
+    if bullish_sweep:
+        is_engulfing = confirm_candle["close"] > sweep_candle["open"] and confirm_candle["open"] < sweep_candle["close"]
+        body_pct = (confirm_candle["close"] - confirm_candle["open"]) / confirm_candle["open"] * 100
+        is_strong_green = confirm_candle["close"] > confirm_candle["open"] and body_pct >= SMC_CONFIRM_BODY_PCT
+        if is_engulfing or is_strong_green:
+            return "LONG", sweep_candle, confirm_candle, atr
+
+    if bearish_sweep:
+        is_engulfing = confirm_candle["close"] < sweep_candle["open"] and confirm_candle["open"] > sweep_candle["close"]
+        body_pct = (confirm_candle["open"] - confirm_candle["close"]) / confirm_candle["open"] * 100
+        is_strong_red = confirm_candle["close"] < confirm_candle["open"] and body_pct >= SMC_CONFIRM_BODY_PCT
+        if is_engulfing or is_strong_red:
+            return "SHORT", sweep_candle, confirm_candle, atr
+
+    return None
+
+
 def detect_liquidity_sweep(df: pd.DataFrame):
     """Gemini'nin tanimina gore: son kapanan mumun ignesi (wick), son
     SMC_SWEEP_LOOKBACK mumun swing high/low'unu asip, KAPANIS o seviyenin
@@ -2117,6 +2158,24 @@ def detect_fvg(df: pd.DataFrame, direction: str, after_idx: int):
     return None
 
 
+def get_latest_sentiment_score():
+    """sentiment_log.csv'deki en son HAM skoru (-1..+1) dondurur, yoksa None.
+    "FLIP & GO" stratejisinde artik islemi BLOKE etmiyor, sadece risk
+    buyuklugunu belirlemek icin kullaniliyor."""
+    if not os.path.isfile(SENTIMENT_LOG_FILE):
+        return None
+    try:
+        with open(SENTIMENT_LOG_FILE, newline="") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return None
+    for row in reversed(rows):
+        raw = row.get("sentiment_score", "")
+        if raw != "":
+            return float(raw)
+    return None
+
+
 def get_latest_sentiment_bias():
     """sentiment_log.csv'deki en son skora bakip 'LONG'/'SHORT'/None dondurur.
     Esik: SMC_SENTIMENT_THRESHOLD (varsayilan 0.2, -0.2 ile +0.2 arasi notr)."""
@@ -2187,9 +2246,9 @@ def _get_smc_reference_balance():
     return float(free_usdt)
 
 
-def _compute_smc_position_size(symbol: str, entry_price: float, stop_price: float) -> float:
+def _compute_smc_position_size(symbol: str, entry_price: float, stop_price: float, risk_multiplier: float = 1.0) -> float:
     reference_balance = _get_smc_reference_balance()
-    risk_amount = reference_balance * (SMC_RISK_PER_TRADE_PCT / 100)
+    risk_amount = reference_balance * (SMC_RISK_PER_TRADE_PCT / 100) * risk_multiplier
     stop_distance = abs(entry_price - stop_price)
     if stop_distance <= 0:
         return 0
@@ -2198,7 +2257,7 @@ def _compute_smc_position_size(symbol: str, entry_price: float, stop_price: floa
     balance = exchange.fetch_balance()
     free_usdt = balance.get("USDT", {}).get("free") or balance.get("free", {}).get("USDT") or 0
     safe_balance_for_margin = min(reference_balance, free_usdt)
-    max_notional = safe_balance_for_margin * (SMC_POSITION_PCT_OF_BALANCE / 100) * LEVERAGE
+    max_notional = safe_balance_for_margin * (SMC_POSITION_PCT_OF_BALANCE / 100) * LEVERAGE * risk_multiplier
     qty_by_margin_cap = max_notional / entry_price
 
     qty = min(qty_by_risk, qty_by_margin_cap)
@@ -2209,18 +2268,24 @@ def _compute_smc_position_size(symbol: str, entry_price: float, stop_price: floa
     return qty
 
 
-def open_smc_position(symbol: str, direction: str, zone_low: float, zone_high: float, atr14: float):
-    """Bolgeye fiyat girdiginde piyasa emriyle acar (borsaya bekleyen LIMIT
-    KOYMUYORUZ - guvenilirlik sorunu). Stop, zone disina SMC_INITIAL_STOP_ATR_MULT
-    kadar konur; koruma tamamen YAZILIMSAL (bkz. update_smc_trailing_stops)."""
+def open_smc_position(symbol: str, direction: str, sweep_candle, atr14: float, risk_multiplier: float, sentiment_note: str):
+    """"FLIP & GO": teyit mumu kapanir kapanmaz HEMEN piyasa emriyle girer -
+    OB/FVG bolgesi beklemiyoruz. Stop, supurmenin ignesinin (wick) hemen
+    otesine SMC_INITIAL_STOP_ATR_MULT kadar konur (supurme seviyesinin
+    altina/ustune fiyat tekrar giderse kurulum gecersiz sayilir). Koruma
+    tamamen YAZILIMSAL (bkz. update_smc_trailing_stops)."""
     _set_leverage_safe(symbol)
     side = "buy" if direction == "LONG" else "sell"
 
-    zone_edge = zone_low if direction == "LONG" else zone_high
-    provisional_stop = (zone_edge - atr14 * SMC_INITIAL_STOP_ATR_MULT if direction == "LONG"
-                         else zone_edge + atr14 * SMC_INITIAL_STOP_ATR_MULT)
-    entry_estimate = zone_high if direction == "LONG" else zone_low
-    qty = _compute_smc_position_size(symbol, entry_estimate, provisional_stop)
+    sweep_extreme = sweep_candle["low"] if direction == "LONG" else sweep_candle["high"]
+    provisional_stop = (sweep_extreme - atr14 * SMC_INITIAL_STOP_ATR_MULT if direction == "LONG"
+                         else sweep_extreme + atr14 * SMC_INITIAL_STOP_ATR_MULT)
+    try:
+        entry_estimate = exchange.fetch_ticker(symbol)["last"]
+    except Exception:
+        entry_estimate = sweep_candle["close"]
+
+    qty = _compute_smc_position_size(symbol, entry_estimate, provisional_stop, risk_multiplier)
     if qty <= 0:
         return None
 
@@ -2232,8 +2297,7 @@ def open_smc_position(symbol: str, direction: str, zone_low: float, zone_high: f
         except Exception:
             real_entry_price = entry_estimate
 
-    stop_price = (zone_edge - atr14 * SMC_INITIAL_STOP_ATR_MULT if direction == "LONG"
-                  else zone_edge + atr14 * SMC_INITIAL_STOP_ATR_MULT)
+    stop_price = provisional_stop
 
     rows = _read_smc_positions()
     rows.append({
@@ -2244,8 +2308,8 @@ def open_smc_position(symbol: str, direction: str, zone_low: float, zone_high: f
     _write_smc_positions(rows)
 
     send_telegram_message(
-        f"🐋 [Balina/SMC] {symbol} {direction} pozisyon açıldı (Likidite Süpürmesi + Bölge onayı).\n"
-        f"Giriş: {real_entry_price:.6f} | İlk stop: {stop_price:.6f}\n"
+        f"🐋 [Balina/SMC] {symbol} {direction} pozisyon açıldı (Flip & Go: Süpürme + Momentum teyidi).\n"
+        f"Giriş: {real_entry_price:.6f} | İlk stop: {stop_price:.6f} | Risk: %{SMC_RISK_PER_TRADE_PCT * risk_multiplier:.1f} ({sentiment_note})\n"
         f"TP YOK — trailing stop kazananın büyümesine izin veriyor."
     )
     return qty
@@ -2350,55 +2414,26 @@ def update_smc_trailing_stops():
 
 
 def scan_smc_once():
-    """1. Bekleyen bolgeleri kontrol et (fiyat girdiyse ac, suresi dolduysa vazgec).
-    2. Yeni supurme+bolge ara (sentiment yon verdiyse)."""
+    """"FLIP & GO" (2026-07-26): OB/FVG bolgesi beklemeden, supurme + hemen
+    ardindan gelen momentum teyidi olunca ANINDA piyasa emriyle girer.
+    Sentiment artik yon dayatmiyor - sadece risk buyuklugunu belirliyor
+    (destekliyorsa tam risk, notrse yari risk, TERS yondeyse islem iptal)."""
     open_symbols = {r["symbol"] for r in _read_smc_positions()}
-    pending_rows = _read_smc_pending()
-    still_pending = []
-    for p in pending_rows:
-        symbol = p["symbol"]
-        direction = p["direction"]
-        zone_low, zone_high = float(p["zone_low"]), float(p["zone_high"])
-        try:
-            price = exchange.fetch_ticker(symbol)["last"]
-        except Exception:
-            still_pending.append(p)
-            continue
-
-        touched = zone_low <= price <= zone_high
-        if touched:
-            try:
-                open_smc_position(symbol, direction, zone_low, zone_high, float(p["atr14"]))
-            except Exception as e:
-                print(f"{symbol} (SMC): bolgeden giris basarisiz ({e})")
-            continue
-
-        candles_waited = int(p["candles_waited"]) + 1
-        if candles_waited >= SMC_ZONE_WAIT_CANDLES:
-            print(f"{symbol} (SMC): bolge suresi doldu, vazgecildi.")
-            continue
-        p["candles_waited"] = str(candles_waited)
-        still_pending.append(p)
-    _write_smc_pending(still_pending)
-
-    open_symbols = {r["symbol"] for r in _read_smc_positions()}
-    pending_symbols = {p["symbol"] for p in still_pending}
-    if len(open_symbols) + len(pending_symbols) >= MAX_OPEN_POSITIONS:
+    if len(open_symbols) >= MAX_OPEN_POSITIONS:
         return
 
-    bias = get_latest_sentiment_bias()
-    if bias is None:
-        return
+    score = get_latest_sentiment_score()
 
     scanned = 0
     fetch_failed = 0
-    sweep_found = 0
-    zone_found = 0
+    confirmed = 0
+    opened = 0
+    vetoed = 0
 
     for symbol in WATCHLIST:
-        if symbol in open_symbols or symbol in pending_symbols:
+        if symbol in open_symbols:
             continue
-        if len(open_symbols) + len(pending_symbols) >= MAX_OPEN_POSITIONS:
+        if len(open_symbols) >= MAX_OPEN_POSITIONS:
             break
         scanned += 1
         try:
@@ -2409,40 +2444,37 @@ def scan_smc_once():
                 print(f"[Balina/SMC] {symbol}: veri cekilemedi ({e})")
             continue
 
-        sweep_dir = detect_liquidity_sweep(df)
-        if sweep_dir != bias:
+        result = detect_sweep_and_confirmation(df)
+        if result is None:
             continue
-        sweep_found += 1
+        confirmed += 1
+        direction, sweep_candle, confirm_candle, atr14 = result
 
-        sweep_idx = len(df) - 2
-        atr14 = df.iloc[sweep_idx]["atr14"]
-        if pd.isna(atr14):
-            continue
+        # Sentiment: yon dayatmiyor, sadece risk carpani / veto.
+        if score is None:
+            risk_multiplier = 0.5
+            sentiment_note = "duygu verisi yok, %50 risk"
+        elif (direction == "LONG" and score >= SMC_SENTIMENT_THRESHOLD) or \
+             (direction == "SHORT" and score <= -SMC_SENTIMENT_THRESHOLD):
+            risk_multiplier = 1.0
+            sentiment_note = f"duygu destekliyor ({score:+.2f}), tam risk"
+        elif abs(score) < SMC_SENTIMENT_THRESHOLD:
+            risk_multiplier = 0.5
+            sentiment_note = f"duygu nötr ({score:+.2f}), %50 risk"
+        else:
+            vetoed += 1
+            continue  # duygu teknik sinyalin TERSINDE - islem iptal
 
-        zone = detect_order_block(df, sweep_dir, sweep_idx)
-        zone_type = "Order Block"
-        if zone is None:
-            zone = detect_fvg(df, sweep_dir, sweep_idx)
-            zone_type = "FVG"
-        if zone is None:
-            continue
-        zone_found += 1
+        try:
+            opened_qty = open_smc_position(symbol, direction, sweep_candle, atr14, risk_multiplier, sentiment_note)
+            if opened_qty:
+                opened += 1
+                open_symbols.add(symbol)
+        except Exception as e:
+            print(f"[Balina/SMC] {symbol}: giris basarisiz ({e})")
 
-        zone_low, zone_high = zone
-        pending_symbols.add(symbol)
-        rows = _read_smc_pending()
-        rows.append({
-            "symbol": symbol, "direction": sweep_dir, "zone_type": zone_type,
-            "zone_low": zone_low, "zone_high": zone_high, "atr14": atr14, "candles_waited": "0",
-        })
-        _write_smc_pending(rows)
-        send_telegram_message(
-            f"🔍 [Balina/SMC] {symbol}: {sweep_dir} likidite süpürmesi + {zone_type} bulundu.\n"
-            f"Bölge: {zone_low:.6f} - {zone_high:.6f} — fiyatın buraya gelmesi bekleniyor."
-        )
-
-    print(f"[Balina/SMC] Tur özeti: yön={bias} | taranan={scanned} | veri hatası={fetch_failed} | "
-          f"süpürme bulundu={sweep_found} | bölge bulundu={zone_found}")
+    print(f"[Balina/SMC] Tur özeti (Flip&Go): taranan={scanned} | veri hatası={fetch_failed} | "
+          f"teyit bulundu={confirmed} | duygu veto={vetoed} | açılan={opened}")
 
 
 
