@@ -343,7 +343,14 @@ SMC_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "smc_positions.cs
 SMC_FIELDNAMES = ["symbol", "direction", "entry_price", "stop_price", "extreme_price", "entry_time", "against_count"]
 SMC_PENDING_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "smc_pending.csv")
 SMC_PENDING_FIELDNAMES = ["symbol", "direction", "zone_type", "zone_low", "zone_high", "atr14", "candles_waited"]
-SQUEEZE_TRAIL_MULT = float(os.environ.get("SQUEEZE_TRAIL_MULT", "2.0"))  # trailing stop mesafesi de ATR14 * bu katsayi
+SQUEEZE_TRAIL_MULT = float(os.environ.get("SQUEEZE_TRAIL_MULT", "2.5"))  # trailing stop mesafesi de ATR14 * bu katsayi (2.0->2.5: Gemini'nin "nefes alan stop" istegi, 2026-07-26)
+SQUEEZE_MIN_PROFIT_ATR_MULT = float(os.environ.get("SQUEEZE_MIN_PROFIT_ATR_MULT", "1.0"))
+SQUEEZE_MIN_PROFIT_PCT = float(os.environ.get("SQUEEZE_MIN_PROFIT_PCT", "0.5"))  # yuzde
+# Gemini'nin tespit ettigi sorun (2026-07-26): "kar kilitleme" (against_count
+# esigi) komisyonu bile karsilamayan mikroskobik karda (orn %0.02) devreye
+# girip pozisyonu erken kapatiyordu. Artik kar kilitleme/erken cikis, pozisyon
+# EN AZ SQUEEZE_MIN_PROFIT_ATR_MULT*ATR VEYA SQUEEZE_MIN_PROFIT_PCT yuzde net
+# kara gecmeden calismayacak - kucuk gurultu artik tetiklemiyor.
 SQUEEZE_RISK_PER_TRADE_PCT = float(os.environ.get("SQUEEZE_RISK_PER_TRADE_PCT", "10"))
 SQUEEZE_POSITION_PCT_OF_BALANCE = float(os.environ.get("SQUEEZE_POSITION_PCT_OF_BALANCE", "20"))
 SQUEEZE_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "squeeze_positions.csv")
@@ -1388,11 +1395,23 @@ def update_squeeze_trailing_stops():
             candidate_stop = new_extreme - latest_atr * SQUEEZE_TRAIL_MULT
             new_stop = max(current_stop, candidate_stop)
             in_profit = latest_close > entry_price
+            profit_distance = latest_close - entry_price
         else:
             new_extreme = min(extreme, latest_close)
             candidate_stop = new_extreme + latest_atr * SQUEEZE_TRAIL_MULT
             new_stop = min(current_stop, candidate_stop)
             in_profit = latest_close < entry_price
+            profit_distance = entry_price - latest_close
+
+        profit_pct = (profit_distance / entry_price) * 100 if entry_price else 0
+        # Gemini'nin fix'i (2026-07-26): kar kilitleme/erken cikis, pozisyon
+        # EN AZ 1.0*ATR VEYA %0.5 net kara gecmeden devreye girmesin -
+        # komisyonu bile karsilamayan mikroskobik "kar" artik erken cikis
+        # tetiklemiyor.
+        meaningful_profit = in_profit and (
+            profit_distance >= SQUEEZE_MIN_PROFIT_ATR_MULT * latest_atr
+            or profit_pct >= SQUEEZE_MIN_PROFIT_PCT
+        )
 
         against_count = int(r.get("against_count", "0"))
         if new_extreme == extreme and in_profit:
@@ -1401,7 +1420,7 @@ def update_squeeze_trailing_stops():
             against_count = 0
         r["against_count"] = str(against_count)
 
-        if in_profit and against_count >= SQUEEZE_REVERSAL_EXIT_CANDLES:
+        if meaningful_profit and against_count >= SQUEEZE_REVERSAL_EXIT_CANDLES:
             close_err = _close_position(symbol, direction, live_qty)
             current_price = latest_close
             raw_pct = (current_price - entry_price) / entry_price * 100
