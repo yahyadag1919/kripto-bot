@@ -191,6 +191,7 @@ TP_PULLBACK_TOLERANCE_PCT = float(os.environ.get("TP_PULLBACK_TOLERANCE_PCT", "0
 TP_SWING_LOOKBACK = int(os.environ.get("TP_SWING_LOOKBACK", "20"))
 
 TP_LEVERAGE = int(os.environ.get("TP_LEVERAGE", "10"))
+TP_POSITION_PCT_OF_BALANCE = float(os.environ.get("TP_POSITION_PCT_OF_BALANCE", "20"))  # DERS (2026-07-28): risk-bazli miktar hesabinin, dar stop mesafelerinde asiri buyuk notional/marjin talep etmesini onleyen tavan
 TP_RISK_PER_TRADE_PCT = float(os.environ.get("TP_RISK_PER_TRADE_PCT", "2.0"))
 TP_RISK_RANGING_PCT = float(os.environ.get("TP_RISK_RANGING_PCT", "0.5"))
 TP_PARTIAL_CLOSE_PCT = float(os.environ.get("TP_PARTIAL_CLOSE_PCT", "50"))
@@ -519,12 +520,28 @@ def _compute_position_size(symbol: str, entry_price: float, stop_price: float) -
     stop_distance = abs(entry_price - stop_price)
     if stop_distance <= 0:
         return 0
-    qty = risk_amount / stop_distance
+    qty_by_risk = risk_amount / stop_distance
 
-    # DERS (2026-07-28): dusuk fiyatli/yuksek arzli coinlerde (SUPER, GMT,
-    # POLYX vb.) risk bazli qty, borsanin izin verdigi MAKSIMUM emir
-    # miktarini asip -4005 hatasina yol aciyordu. Piyasa limitlerine gore
-    # tavana cekiyoruz - boylece hata hic olusmadan onlenmis oluyor.
+    # DERS (2026-07-28, asil kok neden): risk-bazli qty TEK BASINA, stop
+    # mesafesi cok dar oldugunda (ozellikle YATAY rejimde M15 dalgalanmalar
+    # kucuk oluyor) devasa buyuklukte pozisyon miktari uretebiliyordu - kucuk
+    # bir dolar riski ($55 gibi) hedeflerken bile marjini asan bir notional
+    # cikabiliyordu. Eski dosyada bu ikinci bir tavanla (bakiye/kaldirac
+    # bazli marjin sinirlamasi) engelleniyordu, sifirdan yazimda unutulmustu.
+    # Iki adayin KUCUGUNU aliyoruz - hangisi daha kisitlayiciysa o gecerli olur.
+    try:
+        balance = exchange.fetch_balance()
+        free_usdt = balance.get("USDT", {}).get("free") or balance.get("free", {}).get("USDT") or 0
+    except Exception:
+        free_usdt = reference_balance
+    safe_balance_for_margin = min(reference_balance, free_usdt)
+    max_notional = safe_balance_for_margin * (TP_POSITION_PCT_OF_BALANCE / 100) * TP_LEVERAGE
+    qty_by_margin_cap = max_notional / entry_price
+
+    qty = min(qty_by_risk, qty_by_margin_cap)
+
+    # Borsanin izin verdigi MAKSIMUM emir miktarini da ayrica kontrol et
+    # (dusuk fiyatli/yuksek arzli coinlerde -4005 hatasina yol aciyordu).
     try:
         market = exchange.markets.get(symbol, {})
         max_amount = (market.get("limits", {}) or {}).get("amount", {}).get("max")
