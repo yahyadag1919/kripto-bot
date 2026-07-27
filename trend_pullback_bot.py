@@ -520,6 +520,19 @@ def _compute_position_size(symbol: str, entry_price: float, stop_price: float) -
     if stop_distance <= 0:
         return 0
     qty = risk_amount / stop_distance
+
+    # DERS (2026-07-28): dusuk fiyatli/yuksek arzli coinlerde (SUPER, GMT,
+    # POLYX vb.) risk bazli qty, borsanin izin verdigi MAKSIMUM emir
+    # miktarini asip -4005 hatasina yol aciyordu. Piyasa limitlerine gore
+    # tavana cekiyoruz - boylece hata hic olusmadan onlenmis oluyor.
+    try:
+        market = exchange.markets.get(symbol, {})
+        max_amount = (market.get("limits", {}) or {}).get("amount", {}).get("max")
+        if max_amount and qty > max_amount:
+            qty = max_amount
+    except Exception:
+        pass
+
     try:
         qty = float(exchange.amount_to_precision(symbol, qty))
     except Exception:
@@ -849,10 +862,17 @@ def scan_for_entries():
     scanned = 0
     trend_found = 0
     entries = 0
+    margin_exhausted = False
     for symbol in WATCHLIST:
         if symbol in open_symbols:
             continue
         if len(open_symbols) >= MAX_OPEN_POSITIONS:
+            break
+        if margin_exhausted:
+            # Bir kere marjin yetersiz cikinca, ayni turda denenen SONRAKI
+            # her coin de ayni sebeple basarisiz olur - tek tek deneyip her
+            # birinde ayri Dedektif raporu gondermek yerine, bu turu burada
+            # kesiyoruz (2026-07-28, tekrarlanan -2019 spam'ini onlemek icin).
             break
         scanned += 1
         try:
@@ -870,6 +890,9 @@ def scan_for_entries():
                 open_symbols.add(symbol)
         except Exception as e:
             print(f"{symbol}: tarama hatasi ({e})")
+            if "-2019" in str(e) or "insufficient" in str(e).lower():
+                margin_exhausted = True
+                print("Marjin tukendigi tespit edildi - bu turda baska yeni islem denenmeyecek.")
 
     print(f"Tur özeti: rejim={_current_regime} | taranan={scanned} | H1 trend bulundu={trend_found} | açılan={entries}")
 
