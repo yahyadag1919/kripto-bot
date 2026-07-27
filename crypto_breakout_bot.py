@@ -387,11 +387,12 @@ TP_RISK_PER_TRADE_PCT = float(os.environ.get("TP_RISK_PER_TRADE_PCT", "2.0"))
 TP_PARTIAL_CLOSE_PCT = float(os.environ.get("TP_PARTIAL_CLOSE_PCT", "50"))  # yuzde
 TP_PARTIAL_TP_R_MULT = float(os.environ.get("TP_PARTIAL_TP_R_MULT", "1.5"))  # 1.5R = stop mesafesinin 1.5 kati
 TP_POST_BREAKEVEN_TRAIL_MULT = float(os.environ.get("TP_POST_BREAKEVEN_TRAIL_MULT", "2.0"))
+TP_STOP_MISSING_CIRCUIT_BREAKER = int(os.environ.get("TP_STOP_MISSING_CIRCUIT_BREAKER", "2"))  # bu kadar tur uste stop saglanamazsa HEMEN kapat (2026-07-27, Gemini'nin "sonsuz dongu" bulgusu)
 TP_REFERENCE_BALANCE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "tp_reference_balance.txt")
 TP_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "tp_positions.csv")
 TP_FIELDNAMES = ["symbol", "direction", "entry_price", "stop_price", "extreme_price", "entry_time",
                   "against_count", "exchange_stop_order_id", "partial_tp_price", "partial_tp_taken",
-                  "original_qty", "exchange_tp_order_id"]
+                  "original_qty", "exchange_tp_order_id", "stop_missing_count"]
 
 # --- 1. KATMAN: Haber & Duygu Analizi (SADECE GOZLEM - hicbir islemi
 # etkilemiyor). CoinDesk/CoinTelegraph RSS'lerinden son haber basliklarini
@@ -2303,6 +2304,7 @@ def _read_tp_positions():
         r.setdefault("partial_tp_taken", "0")
         r.setdefault("original_qty", "")
         r.setdefault("exchange_tp_order_id", "")
+        r.setdefault("stop_missing_count", "0")
     return rows
 
 
@@ -2420,7 +2422,26 @@ def update_tp_positions():
             continue
 
         if live_qty == 0:
-            # Pozisyon kapanmis (borsa stop/TP'si tetiklenmis olabilir) - kayittan dus.
+            # Pozisyon kapanmis (borsa stop/TP'si tetiklenmis olabilir).
+            # ARTIK SESSIZCE DUSMUYOR - Gemini'nin bulgusu geregi (2026-07-27):
+            # once bildirim yoktu, kullanici pozisyonun ne zaman/nasil
+            # kapandigini hic gormuyordu. Guncel fiyati kapanis fiyati olarak
+            # KABACA kullanip (borsanin tam gerceklesme fiyatini ayrica
+            # sorgulamiyoruz - basitlik icin yaklasik deger) bildirip logluyoruz.
+            try:
+                exit_price_guess = exchange.fetch_ticker(symbol)["last"]
+            except Exception:
+                exit_price_guess = entry_price
+            raw_pct = (exit_price_guess - entry_price) / entry_price * 100
+            pct_change = raw_pct if direction == "LONG" else -raw_pct
+            reason = "Parsiyel sonrasi Breakeven/Trailing" if partial_tp_taken else "SL/TP (borsa tetikledi)"
+            log_closed_trade(symbol, "Trend-Pullback", direction, entry_price, exit_price_guess, pct_change, reason)
+            send_telegram_message(
+                f"🔔 [Trend-Pullback] {symbol} {direction} pozisyon KAPANDI ({reason}) — "
+                f"borsa tarafında tespit edildi.\n"
+                f"Giriş: {entry_price:.6f} | Yaklaşık çıkış: {exit_price_guess:.6f} | Değişim: {pct_change:+.2f}% "
+                f"(çıkış fiyatı tahmini, borsanın kesin gerçekleşme fiyatı ayrıca sorgulanmadı)"
+            )
             continue
 
         try:
@@ -2512,18 +2533,42 @@ def update_tp_positions():
                     except Exception as e:
                         print(f"{symbol} (Trend-Pullback): trailing stop borsa guncellemesi basarisiz ({e})")
 
-        # ---- GUVENLIK: borsa stop emri hala var mi kontrol et, yoksa yeniden koy ----
+        # ---- GUVENLIK: borsa stop emri hala var mi kontrol et, yoksa yeniden koy.
+        # DEVRE KESICI (2026-07-27, Gemini'nin bulgusu): eskiden bu sinirsizce
+        # tekrarlanabiliyordu ("sonsuz donguye girdi"). Artik ust uste
+        # TP_STOP_MISSING_CIRCUIT_BREAKER kadar turda stop hala yerlestirilemezse/
+        # bulunamazsa, tekrar denemek yerine pozisyonu HEMEN piyasa emriyle
+        # kapatiyoruz - korumasiz surunceme kalmasindansa cikmak daha guvenli. ----
+        missing_count = int(r.get("stop_missing_count", "0"))
         try:
             open_orders = exchange.fetch_open_orders(symbol)
             has_stop = any(o.get("id") == r.get("exchange_stop_order_id") for o in open_orders) if r.get("exchange_stop_order_id") else False
             if not has_stop:
+                missing_count += 1
+                r["stop_missing_count"] = str(missing_count)
+                if missing_count >= TP_STOP_MISSING_CIRCUIT_BREAKER:
+                    send_telegram_message(
+                        f"🚨 [Trend-Pullback] {symbol}: borsa stop emri {missing_count} tur üst üste "
+                        f"sağlanamadı — sonsuz döngüye girmemek için pozisyon HEMEN piyasa emriyle kapatılıyor."
+                    )
+                    close_err = _close_position(symbol, direction, live_qty)
+                    if not close_err:
+                        raw_pct = (price - entry_price) / entry_price * 100
+                        pct_change = raw_pct if direction == "LONG" else -raw_pct
+                        log_closed_trade(symbol, "Trend-Pullback", direction, entry_price, price, pct_change, "Acil kapatma (stop garantilenemedi)")
+                        continue
+                    else:
+                        still_open.append(r)
+                        continue
                 stop_side = "sell" if direction == "LONG" else "buy"
                 new_stop_order = exchange.create_order(
                     symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
                     params={"stopPrice": stop_price, "reduceOnly": True},
                 )
                 r["exchange_stop_order_id"] = new_stop_order.get("id", "")
-                send_telegram_message(f"🛡️ [Trend-Pullback] {symbol}: borsa stop emri bulunamadı, yeniden koyuldu.")
+                send_telegram_message(f"🛡️ [Trend-Pullback] {symbol}: borsa stop emri bulunamadı, yeniden koyuldu ({missing_count}. deneme).")
+            else:
+                r["stop_missing_count"] = "0"
         except Exception as e:
             print(f"{symbol} (Trend-Pullback): borsa stop kontrolu basarisiz ({e})")
 
