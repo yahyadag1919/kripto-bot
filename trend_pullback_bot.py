@@ -126,6 +126,7 @@ _ERROR_HINTS = {
     "429": "Borsa/Gemini API istek limitine takildi (rate limit) - gecici olmali.",
     "insufficient": "Bakiye/marjin yetersiz olabilir.",
     "timeout": "Baglanti zaman asimina ugradi - gecici bir ag sorunu olabilir.",
+    "no such file or directory": "DATA_DIR/Volume yolu henuz olusturulmamis veya yanlis ayarlanmis olabilir.",
 }
 
 
@@ -166,6 +167,11 @@ def track_errors(func):
 # AYARLAR
 # ============================================================
 DATA_DIR = os.environ.get("DATA_DIR", ".")
+# DERS (2026-07-28, Dedektif'in yakaladigi ilk gercek hata): DATA_DIR bir
+# Railway Volume yoluna (orn. /data) ayarlanmissa ama bu klasor henuz
+# olusturulmamissa, pozisyon dosyasina yazarken "No such file or directory"
+# hatasi aliniyordu. Baslarken klasoru garanti altina aliyoruz.
+os.makedirs(DATA_DIR, exist_ok=True)
 CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "5"))
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "5"))
 NEW_TRADES_HALTED = os.environ.get("NEW_TRADES_HALTED", "false").lower() == "true"
