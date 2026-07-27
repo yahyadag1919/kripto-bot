@@ -1728,6 +1728,8 @@ def build_orders_message():
         tracked_symbols.add(r["symbol"])
     for r in _read_squeeze_positions():
         tracked_symbols.add(r["symbol"])
+    for r in _read_tp_positions():
+        tracked_symbols.add(r["symbol"])
 
     all_open_orders = []
     for sym in WATCHLIST:
@@ -2115,6 +2117,8 @@ def cleanup_orphaned_orders():
     for r in _read_donchian_positions():
         tracked_symbols.add(r["symbol"])
     for r in _read_squeeze_positions():
+        tracked_symbols.add(r["symbol"])
+    for r in _read_tp_positions():
         tracked_symbols.add(r["symbol"])
 
     all_open_orders = []
@@ -3171,7 +3175,7 @@ def scan_once():
     except Exception as e:
         print(f"[Duygu] beklenmeyen hata, atlaniyor ({e})")
 
-    if DONCHIAN_MODE or SQUEEZE_MODE:
+    if DONCHIAN_MODE or SQUEEZE_MODE or TREND_PULLBACK_MODE:
         try:
             cleanup_orphaned_orders()
         except Exception as e:
