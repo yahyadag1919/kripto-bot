@@ -382,9 +382,16 @@ TP_PULLBACK_TOLERANCE_PCT = float(os.environ.get("TP_PULLBACK_TOLERANCE_PCT", "0
 TP_SWING_LOOKBACK = int(os.environ.get("TP_SWING_LOOKBACK", "20"))  # stop icin M15 swing high/low penceresi
 TP_LEVERAGE = int(os.environ.get("TP_LEVERAGE", "10"))  # Gemini: "maks 10x" - genel LEVERAGE'dan BAGIMSIZ, bu mod icin sabit tavan
 TP_RISK_PER_TRADE_PCT = float(os.environ.get("TP_RISK_PER_TRADE_PCT", "2.0"))
+# HIBRID CIKIS MIMARISI (2026-07-27, Gemini): %50 parsiyel TP (1.5R) -> stop
+# breakeven'e cekilir -> kalan %50 icin trailing stop (2.0xATR).
+TP_PARTIAL_CLOSE_PCT = float(os.environ.get("TP_PARTIAL_CLOSE_PCT", "50"))  # yuzde
+TP_PARTIAL_TP_R_MULT = float(os.environ.get("TP_PARTIAL_TP_R_MULT", "1.5"))  # 1.5R = stop mesafesinin 1.5 kati
+TP_POST_BREAKEVEN_TRAIL_MULT = float(os.environ.get("TP_POST_BREAKEVEN_TRAIL_MULT", "2.0"))
 TP_REFERENCE_BALANCE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "tp_reference_balance.txt")
 TP_STATE_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "tp_positions.csv")
-TP_FIELDNAMES = ["symbol", "direction", "entry_price", "stop_price", "extreme_price", "entry_time", "against_count", "exchange_stop_order_id"]
+TP_FIELDNAMES = ["symbol", "direction", "entry_price", "stop_price", "extreme_price", "entry_time",
+                  "against_count", "exchange_stop_order_id", "partial_tp_price", "partial_tp_taken",
+                  "original_qty", "exchange_tp_order_id"]
 
 # --- 1. KATMAN: Haber & Duygu Analizi (SADECE GOZLEM - hicbir islemi
 # etkilemiyor). CoinDesk/CoinTelegraph RSS'lerinden son haber basliklarini
@@ -2288,6 +2295,10 @@ def _read_tp_positions():
     for r in rows:
         r.setdefault("against_count", "0")
         r.setdefault("exchange_stop_order_id", "")
+        r.setdefault("partial_tp_price", "")
+        r.setdefault("partial_tp_taken", "0")
+        r.setdefault("original_qty", "")
+        r.setdefault("exchange_tp_order_id", "")
     return rows
 
 
@@ -2332,19 +2343,41 @@ def open_trend_pullback_position(symbol: str, direction: str, entry_price: float
     except Exception as e:
         print(f"{symbol} (Trend-Pullback): borsa stop emri konulamadi ({e}) - YAZILIMSAL yedek devrede olacak")
 
+    # HIBRID CIKIS (2026-07-27, Gemini): %50 icin 1.5R parsiyel TP emri.
+    stop_distance = abs(real_entry_price - stop_price)
+    partial_tp_price = (real_entry_price + stop_distance * TP_PARTIAL_TP_R_MULT if direction == "LONG"
+                         else real_entry_price - stop_distance * TP_PARTIAL_TP_R_MULT)
+    partial_qty = qty * (TP_PARTIAL_CLOSE_PCT / 100)
+    try:
+        partial_qty = float(exchange.amount_to_precision(symbol, partial_qty))
+    except Exception:
+        pass
+    tp_order_id = ""
+    try:
+        tp_order = exchange.create_order(
+            symbol, type="TAKE_PROFIT_MARKET", side=stop_side, amount=partial_qty,
+            params={"stopPrice": partial_tp_price, "reduceOnly": True},
+        )
+        tp_order_id = tp_order.get("id", "")
+    except Exception as e:
+        print(f"{symbol} (Trend-Pullback): borsa TP emri konulamadi ({e}) - YAZILIMSAL yedek devrede olacak")
+
     rows = _read_tp_positions()
     rows.append({
         "symbol": symbol, "direction": direction,
         "entry_price": real_entry_price, "stop_price": stop_price, "extreme_price": real_entry_price,
         "entry_time": datetime.now().isoformat(), "against_count": "0",
         "exchange_stop_order_id": stop_order_id,
+        "partial_tp_price": partial_tp_price, "partial_tp_taken": "0",
+        "original_qty": qty, "exchange_tp_order_id": tp_order_id,
     })
     _write_tp_positions(rows)
 
     send_telegram_message(
         f"📈 [Trend-Pullback] {symbol} {direction} pozisyon açıldı (H1 trend + M15 pullback).\n"
-        f"Giriş: {real_entry_price:.6f} | Stop (M15 swing): {stop_price:.6f}\n"
-        f"{'✅ Borsa stop emri aktif' if stop_order_id else '⚠️ Borsa stop KONULAMADI, sadece yazılımsal koruma aktif'}\n"
+        f"Giriş: {real_entry_price:.6f} | Stop: {stop_price:.6f} | Parsiyel TP (%{TP_PARTIAL_CLOSE_PCT}, {TP_PARTIAL_TP_R_MULT}R): {partial_tp_price:.6f}\n"
+        f"{'✅ Borsa stop emri aktif' if stop_order_id else '⚠️ Borsa stop KONULAMADI, sadece yazılımsal koruma aktif'} | "
+        f"{'✅ Borsa TP emri aktif' if tp_order_id else '⚠️ Borsa TP KONULAMADI, sadece yazılımsal koruma aktif'}\n"
         f"Kaldıraç: {TP_LEVERAGE}x | Risk: %{TP_RISK_PER_TRADE_PCT}"
     )
     return qty
@@ -2363,7 +2396,12 @@ def update_tp_positions():
         direction = r["direction"]
         entry_price = float(r["entry_price"])
         stop_price = float(r["stop_price"])
+        extreme_price = float(r["extreme_price"])
         stop_order_id = r.get("exchange_stop_order_id", "")
+        tp_order_id = r.get("exchange_tp_order_id", "")
+        partial_tp_taken = r.get("partial_tp_taken", "0") == "1"
+        partial_tp_price = float(r["partial_tp_price"]) if r.get("partial_tp_price") else None
+        original_qty = float(r["original_qty"]) if r.get("original_qty") else None
 
         try:
             positions = exchange.fetch_positions([symbol])
@@ -2378,13 +2416,102 @@ def update_tp_positions():
             continue
 
         if live_qty == 0:
-            # Pozisyon kapanmis (borsa stop'u tetiklenmis olabilir) - kayittan dus.
+            # Pozisyon kapanmis (borsa stop/TP'si tetiklenmis olabilir) - kayittan dus.
             continue
 
-        # (1) Borsa stop emri hala duruyor mu kontrol et, yoksa yeniden koy.
+        try:
+            price = exchange.fetch_ticker(symbol)["last"]
+        except Exception:
+            still_open.append(r)
+            continue
+
+        # ---- ASAMA 1: PARSIYEL TP HENUZ ALINMADI ----
+        if not partial_tp_taken and partial_tp_price is not None:
+            tp_hit = (price >= partial_tp_price) if direction == "LONG" else (price <= partial_tp_price)
+            if tp_hit:
+                # YAZILIMSAL/borsa TP tetiklenmis olabilir (live_qty zaten
+                # azalmis olabilir) - ya da yazilimsal olarak BIZ kapatiyoruz.
+                partial_qty = original_qty * (TP_PARTIAL_CLOSE_PCT / 100) if original_qty else live_qty * 0.5
+                if live_qty > partial_qty * 0.9:  # borsa TP'si henuz tetiklenmemis - biz kapatalim
+                    try:
+                        close_side = "sell" if direction == "LONG" else "buy"
+                        exchange.create_order(symbol, type="market", side=close_side,
+                                               amount=min(partial_qty, live_qty), params={"reduceOnly": True})
+                    except Exception as e:
+                        print(f"{symbol} (Trend-Pullback): parsiyel TP kapatma basarisiz ({e})")
+                        still_open.append(r)
+                        continue
+
+                # RISK SIFIRLAMA: stop'u girise (breakeven) cek.
+                r["partial_tp_taken"] = "1"
+                r["stop_price"] = str(entry_price)
+                r["extreme_price"] = str(entry_price)
+                try:
+                    open_orders = exchange.fetch_open_orders(symbol)
+                    for o in open_orders:
+                        if o.get("id") in (stop_order_id, tp_order_id):
+                            exchange.cancel_order(o["id"], symbol)
+                    remaining_qty = live_qty - partial_qty
+                    stop_side = "sell" if direction == "LONG" else "buy"
+                    new_stop = exchange.create_order(
+                        symbol, type="STOP_MARKET", side=stop_side, amount=max(remaining_qty, 0),
+                        params={"stopPrice": entry_price, "reduceOnly": True},
+                    )
+                    r["exchange_stop_order_id"] = new_stop.get("id", "")
+                    r["exchange_tp_order_id"] = ""
+                except Exception as e:
+                    print(f"{symbol} (Trend-Pullback): breakeven stop guncellenemedi ({e}) - yazilimsal kontrol yine de calisiyor")
+
+                raw_pct = (price - entry_price) / entry_price * 100
+                pct_change = raw_pct if direction == "LONG" else -raw_pct
+                send_telegram_message(
+                    f"💰 [Trend-Pullback] {symbol} {direction}: %{TP_PARTIAL_CLOSE_PCT} parsiyel TP alındı "
+                    f"({TP_PARTIAL_TP_R_MULT}R, {pct_change:+.2f}%). Stop girişe (breakeven) çekildi, "
+                    f"kalan pozisyon trailing stop ile devam ediyor."
+                )
+                still_open.append(r)
+                continue
+
+        # ---- ASAMA 2: PARSIYEL TP ALINDI - KALAN POZISYON ICIN TRAILING ----
+        if partial_tp_taken:
+            try:
+                df = fetch_tp_df(symbol, TP_M15_TIMEFRAME, 60)
+                df["atr14"] = _compute_atr(df, ATR_PERIOD)
+                latest_atr = df.iloc[-2]["atr14"]
+            except Exception as e:
+                print(f"{symbol} (Trend-Pullback): ATR guncellenemedi ({e})")
+                still_open.append(r)
+                continue
+
+            if not pd.isna(latest_atr):
+                if direction == "LONG":
+                    new_extreme = max(extreme_price, price)
+                    new_stop = max(stop_price, new_extreme - latest_atr * TP_POST_BREAKEVEN_TRAIL_MULT)
+                else:
+                    new_extreme = min(extreme_price, price)
+                    new_stop = min(stop_price, new_extreme + latest_atr * TP_POST_BREAKEVEN_TRAIL_MULT)
+                if new_stop != stop_price:
+                    r["stop_price"] = str(new_stop)
+                    r["extreme_price"] = str(new_extreme)
+                    stop_price = new_stop
+                    try:
+                        open_orders = exchange.fetch_open_orders(symbol)
+                        for o in open_orders:
+                            if o.get("id") == r.get("exchange_stop_order_id"):
+                                exchange.cancel_order(o["id"], symbol)
+                        stop_side = "sell" if direction == "LONG" else "buy"
+                        updated_stop = exchange.create_order(
+                            symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
+                            params={"stopPrice": new_stop, "reduceOnly": True},
+                        )
+                        r["exchange_stop_order_id"] = updated_stop.get("id", "")
+                    except Exception as e:
+                        print(f"{symbol} (Trend-Pullback): trailing stop borsa guncellemesi basarisiz ({e})")
+
+        # ---- GUVENLIK: borsa stop emri hala var mi kontrol et, yoksa yeniden koy ----
         try:
             open_orders = exchange.fetch_open_orders(symbol)
-            has_stop = any(o.get("id") == stop_order_id for o in open_orders) if stop_order_id else False
+            has_stop = any(o.get("id") == r.get("exchange_stop_order_id") for o in open_orders) if r.get("exchange_stop_order_id") else False
             if not has_stop:
                 stop_side = "sell" if direction == "LONG" else "buy"
                 new_stop_order = exchange.create_order(
@@ -2396,23 +2523,18 @@ def update_tp_positions():
         except Exception as e:
             print(f"{symbol} (Trend-Pullback): borsa stop kontrolu basarisiz ({e})")
 
-        # (2) YAZILIMSAL yedek - borsa emri her nedense sessizce basarisiz
-        # olsa/tetiklenmese bile, guncel fiyat stop seviyesini gectiyse HEMEN kapat.
-        try:
-            price = exchange.fetch_ticker(symbol)["last"]
-        except Exception:
-            still_open.append(r)
-            continue
-
+        # ---- YAZILIMSAL YEDEK: borsa emri her nedense sessizce basarisiz
+        # olsa/tetiklenmese bile, guncel fiyat stop seviyesini gectiyse HEMEN kapat. ----
         breached = (price <= stop_price) if direction == "LONG" else (price >= stop_price)
         if breached:
             close_err = _close_position(symbol, direction, live_qty)
             raw_pct = (price - entry_price) / entry_price * 100
             pct_change = raw_pct if direction == "LONG" else -raw_pct
             if not close_err:
-                log_closed_trade(symbol, "Trend-Pullback", direction, entry_price, price, pct_change, "SL")
+                exit_label = "Breakeven/Trailing" if partial_tp_taken else "SL"
+                log_closed_trade(symbol, "Trend-Pullback", direction, entry_price, price, pct_change, exit_label)
                 send_telegram_message(
-                    f"📉 [Trend-Pullback] {symbol} {direction} pozisyon stop'a takıldı. "
+                    f"📉 [Trend-Pullback] {symbol} {direction} pozisyon kapandı ({exit_label}). "
                     f"Giriş: {entry_price:.6f} | Çıkış: {price:.6f} | Değişim: {pct_change:+.2f}%"
                 )
             else:
