@@ -3,12 +3,20 @@ trend_pullback_bot.py
 ======================
 SIFIRDAN TEMIZ KURULUM v2 (2026-07-27, Gemini'nin 4 katmanli mimarisi)
 + TAMIRCI KATMANI (2026-07-28, Gemini ile birlikte, mevcut kod uzerine eklendi)
++ ANA PORTFOY BEYNI (2026-07-28, Gemini'nin talebi)
++ ZERO EXCHANGE ORDERS (2026-07-28, Gemini'nin NIHAI karari): -4045 devre kesici
+  faciasini kalici olarak bitirmek icin borsaya STOP_MARKET/TAKE_PROFIT_MARKET
+  DAHIL hicbir kosullu emir gonderilmiyor. Stop VE TP tamamen yazilimsal
+  (her cycle'da fiyat kontrolu + market emriyle kapatma). Eski "Devre
+  Kesiciler" katmani (borsa stop'u kayipsa 3 turda zorla kapatma) bu
+  degisiklikle birlikte anlamsizlasti ve kaldirildi - artik tek koruma
+  katmani yazilimsal fiyat kontrolu.
 
+0. KATMAN: ANA PORTFÖY BEYNİ (günlük kayıp limiti, ardışık kayıp cooldown'u)
 1. KATMAN: SISTEM DEDEKTIFI (Error Tracker & Profiler)
-2. KATMAN: TAMIRCI (Auto-Healer / Self-Healing)
-3. KATMAN: DEVRE KESICILER VE GUVENLIK
-4. KATMAN: PIYASA BEYNI (Dynamic Market Allocator)
-5. KATMAN: CEKIRDEK STRATEJI MOTORU (Trend-Pullback)
+2. KATMAN: TAMIRCI (Auto-Healer / Self-Healing — ağ/oturum hataları için)
+3. KATMAN: PIYASA BEYNI (Dynamic Market Allocator)
+4. KATMAN: CEKIRDEK STRATEJI MOTORU (Trend-Pullback, %100 yazılımsal stop+TP)
 """
 
 import os
@@ -861,49 +869,19 @@ def open_position(symbol: str, direction: str, entry_price: float, atr14: float,
         except Exception:
             real_entry_price = entry_price
 
+    # DERS (2026-07-28, Gemini'nin NIHAI karari - onceki "borsa stop'unu koru"
+    # kararinin YERINE gecti): borsa tarafina artik HICBIR kosullu emir
+    # (STOP_MARKET dahil) GONDERILMIYOR. -4045 devre kesici faciasi (her
+    # pozisyonun 3 turda bir zorla kapatilmasi) stratejiyi test edilemez hale
+    # getirdigi icin, stop da TP gibi tamamen yazilimsal hale getirildi:
+    # update_positions() her cycle'da fiyati stop_price ile karsilastirip
+    # gerekirse market emriyle kapatiyor (asagida degismedi). BILINCLI KABUL
+    # EDILEN RISK: artik ne borsa ne yazilim koruma orta katmani var - bot
+    # cakilir/gecikirse/Railway yeniden baslarsa, o sure boyunca pozisyon
+    # HICBIR koruma altinda degildir. Bu tradeoff Gemini'ye acikca sorulup
+    # onaylanmisti (rapor 2, soru 3).
     stop_price = swing_stop
-    stop_side = "sell" if direction == "LONG" else "buy"
     stop_order_id = ""
-    stop_missing_at_entry = False
-    try:
-        stop_order = exchange.create_order(
-            symbol, type="STOP_MARKET", side=stop_side, amount=qty,
-            params={"stopPrice": stop_price, "reduceOnly": True},
-        )
-        stop_order_id = stop_order.get("id", "")
-    except Exception as e:
-        # TAMIRCI: kapatmadan once bir onarim + tek seferlik yeniden deneme sansi.
-        repaired = tamirci_attempt_repair(symbol, e)
-        if repaired:
-            try:
-                stop_order = exchange.create_order(
-                    symbol, type="STOP_MARKET", side=stop_side, amount=qty,
-                    params={"stopPrice": stop_price, "reduceOnly": True},
-                )
-                stop_order_id = stop_order.get("id", "")
-                send_telegram_message(f"🛠️ [TAMİRCİ DEVREYE GİRDİ] {symbol}: stop emri sorunu giderildi, işleme devam ediliyor.")
-            except Exception as e2:
-                e = e2  # asagidaki mesaj/kayit icin son hatayi kullan
-
-        if not stop_order_id:
-            # DERS (2026-07-28): girişte borsa stop emri konulamadigi anda pozisyonu
-            # ANINDA kapatmak asiri tepkiydi - -4045 gibi hatalar Demo Trading'in
-            # bilinen tutarsiz/gecici platform kusurlarindan biri (bkz. proje notlari)
-            # ve cogunlukla tek seferlik. update_positions() zaten devam eden
-            # pozisyonlar icin TAM da bu senaryoya karsi bir hibrit desen icermektedir:
-            # her turda borsa stop'unu yeniden koymayi dener (Tamirci onariyla
-            # birlikte), fiyat stop seviyesini gectiginde yazilimsal olarak (borsa
-            # emri olsun olmasin) kapatir, ve sadece 3 tur ust uste basarisiz olursa
-            # devre kesiciyle zorla kapatir (missing_count / CIRCUIT_BREAKER_MAX_FAILURES).
-            # Girişte de ayni desene uyup pozisyonu ACIK BIRAKIYORUZ.
-            stop_missing_at_entry = True
-            print(f"{symbol}: giriste borsa stop emri konulamadi ({e}), Tamirci onarimi da yetersiz kaldi - pozisyon acik tutuluyor, yazilimsal yedek devrede.")
-            if _is_stop_limit_error(e):
-                # Hesap genelindeki stop emri limiti dolu olabilir - bu turda
-                # denenecek SONRAKI coinler de ayni sebeple basarisiz olur, o yuzden
-                # scan_for_entries'e bu turu erken kesmesi icin sinyal veriyoruz.
-                # (Bu pozisyonu kapatmiyor, sadece taramayi durduruyor.)
-                _mark_stop_limit_reached()
 
     stop_distance = abs(real_entry_price - stop_price)
     partial_tp_price = (real_entry_price + stop_distance * TP_PARTIAL_TP_R_MULT if direction == "LONG"
@@ -913,16 +891,7 @@ def open_position(symbol: str, direction: str, entry_price: float, atr14: float,
         partial_qty = float(exchange.amount_to_precision(symbol, partial_qty))
     except Exception:
         pass
-    # DERS (2026-07-28, Gemini'nin nihai mimari karari): TP emri artik borsaya
-    # HIC KOYULMUYOR. Zaten update_positions() her cycle'da partial_tp_price'i
-    # fiyatla karsilastirip gerekirse market emriyle kapatiyordu (asagida
-    # degismedi) - borsadaki TAKE_PROFIT_MARKET emri fiilen hic kullanilmayan,
-    # sadece koşullu emir kapasitesini tuketen fazladan bir emirdi. Kaldirilmasi
-    # -4045'in ana nedeni olan hesap-geneli koşullu emir sayisini yariya
-    # indiriyor (MAX_OPEN_POSITIONS ile birlikte, borsada sadece stop emirleri
-    # kalir). TP guvenlik-kritik degil - bir cycle kacirilsa bile en kotu
-    # ihtimalle kar kilitlenmesi birkac dakika gecikir, pozisyon risk altina
-    # girmez (stop hala borsada/yazilimsal yedekte).
+    # TP emri de (2026-07-28'den beri) borsaya hic koyulmuyor - asagida degismedi.
     tp_order_id = ""
 
     rows = _read_positions()
@@ -933,7 +902,7 @@ def open_position(symbol: str, direction: str, entry_price: float, atr14: float,
         "exchange_stop_order_id": stop_order_id,
         "partial_tp_price": partial_tp_price, "partial_tp_taken": "0",
         "original_qty": qty, "exchange_tp_order_id": tp_order_id,
-        "stop_missing_count": "1" if stop_missing_at_entry else "0",
+        "stop_missing_count": "0",
     })
     _write_positions(rows)
 
@@ -941,8 +910,7 @@ def open_position(symbol: str, direction: str, entry_price: float, atr14: float,
         f"📈 {symbol} {direction} pozisyon açıldı (H1 trend + M15 pullback) [Rejim: {_current_regime}].\n"
         f"Giriş: {real_entry_price:.6f} | Stop: {stop_price:.6f} | "
         f"Parsiyel TP (%{TP_PARTIAL_CLOSE_PCT}, {TP_PARTIAL_TP_R_MULT}R): {partial_tp_price:.6f}\n"
-        f"{'✅ Borsa stop aktif' if stop_order_id else '⚠️ Borsa stop KONULAMADI'} | "
-        f"🖥️ TP yazılımsal takip ediliyor\n"
+        f"🖥️ Stop VE TP tamamen yazılımsal takip ediliyor (borsaya koşullu emir gönderilmiyor)\n"
         f"Kaldıraç: {TP_LEVERAGE}x | Risk: %{_effective_risk_pct():.2f}"
     )
     return qty
@@ -1017,22 +985,9 @@ def update_positions():
                 r["partial_tp_taken"] = "1"
                 r["stop_price"] = str(entry_price)
                 r["extreme_price"] = str(entry_price)
-                try:
-                    open_orders = exchange.fetch_open_orders(symbol)
-                    for o in open_orders:
-                        if o.get("id") in (r.get("exchange_stop_order_id"), r.get("exchange_tp_order_id")):
-                            exchange.cancel_order(o["id"], symbol)
-                    remaining_qty = max(live_qty - partial_qty, 0)
-                    stop_side = "sell" if direction == "LONG" else "buy"
-                    new_stop = exchange.create_order(
-                        symbol, type="STOP_MARKET", side=stop_side, amount=remaining_qty,
-                        params={"stopPrice": entry_price, "reduceOnly": True},
-                    )
-                    r["exchange_stop_order_id"] = new_stop.get("id", "")
-                    r["exchange_tp_order_id"] = ""
-                    r["stop_missing_count"] = "0"
-                except Exception as e:
-                    print(f"{symbol}: breakeven stop guncellenemedi ({e})")
+                # DERS (2026-07-28): borsada stop emri olmadigi icin burada
+                # sadece yazilimsal stop_price guncelleniyor - artik iptal/
+                # yeniden-koy borsa cagrisi yok.
 
                 raw_pct = (price - entry_price) / entry_price * 100
                 pct_change = raw_pct if direction == "LONG" else -raw_pct
@@ -1064,73 +1019,13 @@ def update_positions():
                     r["stop_price"] = str(new_stop)
                     r["extreme_price"] = str(new_extreme)
                     stop_price = new_stop
-                    try:
-                        open_orders = exchange.fetch_open_orders(symbol)
-                        for o in open_orders:
-                            if o.get("id") == r.get("exchange_stop_order_id"):
-                                exchange.cancel_order(o["id"], symbol)
-                        stop_side = "sell" if direction == "LONG" else "buy"
-                        updated_stop = exchange.create_order(
-                            symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
-                            params={"stopPrice": new_stop, "reduceOnly": True},
-                        )
-                        r["exchange_stop_order_id"] = updated_stop.get("id", "")
-                    except Exception as e:
-                        print(f"{symbol}: trailing stop borsa guncellemesi basarisiz ({e})")
+                    # DERS (2026-07-28): borsa emri yok - trailing sadece
+                    # yazilimsal stop_price'i guncelliyor, borsa cagrisi yok.
 
-        missing_count = int(r.get("stop_missing_count", "0"))
-        try:
-            open_orders = exchange.fetch_open_orders(symbol)
-            has_stop = any(o.get("id") == r.get("exchange_stop_order_id") for o in open_orders) if r.get("exchange_stop_order_id") else False
-            if not has_stop:
-                missing_count += 1
-                r["stop_missing_count"] = str(missing_count)
-                if missing_count >= CIRCUIT_BREAKER_MAX_FAILURES:
-                    send_telegram_message(
-                        f"🚨 {symbol}: borsa stop emri {missing_count} tur üst üste sağlanamadı — "
-                        f"DEVRE KESİCİ devreye girdi, pozisyon HEMEN kapatılıyor."
-                    )
-                    close_err = _close_position(symbol, direction, live_qty)
-                    if not close_err:
-                        raw_pct = (price - entry_price) / entry_price * 100
-                        pct_change = raw_pct if direction == "LONG" else -raw_pct
-                        log_closed_trade(symbol, direction, entry_price, price, pct_change, "Devre kesici (stop garantilenemedi)")
-                        continue
-                    else:
-                        still_open.append(r)
-                        continue
-                stop_side = "sell" if direction == "LONG" else "buy"
-                try:
-                    new_stop_order = exchange.create_order(
-                        symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
-                        params={"stopPrice": stop_price, "reduceOnly": True},
-                    )
-                    r["exchange_stop_order_id"] = new_stop_order.get("id", "")
-                    send_telegram_message(f"🛡️ {symbol}: borsa stop emri bulunamadı, yeniden koyuldu ({missing_count}/{CIRCUIT_BREAKER_MAX_FAILURES}).")
-                except Exception as e:
-                    # TAMIRCI: dogrudan yeniden koyma basarisiz oldu - once onarim
-                    # dene (hayalet emirleri temizle / oturumu sifirla), sonra
-                    # bir kez daha dene. Bu da basarisiz olursa mevcut devre
-                    # kesici sayaci (missing_count, yukarida zaten arttirildi)
-                    # normal akisinda ilerlemeye devam eder.
-                    repaired = tamirci_attempt_repair(symbol, e)
-                    if repaired:
-                        try:
-                            new_stop_order = exchange.create_order(
-                                symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
-                                params={"stopPrice": stop_price, "reduceOnly": True},
-                            )
-                            r["exchange_stop_order_id"] = new_stop_order.get("id", "")
-                            r["stop_missing_count"] = "0"
-                            send_telegram_message(f"🛠️ [TAMİRCİ DEVREYE GİRDİ] {symbol}: stop emri sorunu giderildi, işleme devam ediliyor.")
-                        except Exception as e2:
-                            print(f"{symbol}: Tamirci onarimindan sonra da stop konulamadi ({e2})")
-                    else:
-                        print(f"{symbol}: stop yeniden koyulamadi, Tamirci bu hata turu icin onarim uygulamadi ({e})")
-            else:
-                r["stop_missing_count"] = "0"
-        except Exception as e:
-            print(f"{symbol}: borsa stop kontrolu basarisiz ({e})")
+        # DERS (2026-07-28, Gemini'nin nihai karari): borsa STOP_MARKET emri
+        # artik hic koyulmadigi icin, "borsa stop'u kayip mi / yeniden koy /
+        # 3 turda devre kesici" mantiginin tamami kaldirildi. Tek koruma
+        # katmani artik hemen asagidaki yazilimsal breach-check.
 
         breached = (price <= stop_price) if direction == "LONG" else (price >= stop_price)
         if breached:
@@ -1407,13 +1302,13 @@ def run_forever():
     if NEW_TRADES_HALTED:
         halt_note = "\n\n🛑 YENİ İŞLEM AÇMA YASAĞI AKTİF (NEW_TRADES_HALTED=true)."
     send_telegram_message(
-        f"🚀 Trend-Pullback botu (5 KATMANLI, TAMİRCİ EKLENDİ) başlatıldı.\n"
-        f"1️⃣ Sistem Dedektifi | 2️⃣ Tamirci (Auto-Healer) | 3️⃣ Devre Kesiciler | 4️⃣ Piyasa Beyni | 5️⃣ Trend-Pullback\n"
+        f"🚀 Trend-Pullback botu (ZERO EXCHANGE ORDERS mimarisi) başlatıldı.\n"
+        f"1️⃣ Sistem Dedektifi | 2️⃣ Tamirci (Auto-Healer) | 3️⃣ Piyasa Beyni | 4️⃣ Trend-Pullback\n"
         f"{len(WATCHLIST)} coin taranıyor. Güncel rejim: {_current_regime} (risk: %{_current_risk_pct})\n"
-        f"Hibrit çıkış: %{TP_PARTIAL_CLOSE_PCT} parsiyel TP ({TP_PARTIAL_TP_R_MULT}R, 🖥️ tamamen yazılımsal) → breakeven → "
+        f"Hibrit çıkış: %{TP_PARTIAL_CLOSE_PCT} parsiyel TP ({TP_PARTIAL_TP_R_MULT}R) → breakeven → "
         f"kalan %{100-TP_PARTIAL_CLOSE_PCT} için {TP_POST_BREAKEVEN_TRAIL_MULT}×ATR trailing.\n"
-        f"Borsada sadece stop emri tutulur (max {MAX_OPEN_POSITIONS} pozisyon → en fazla {MAX_OPEN_POSITIONS} koşullu emir).\n"
-        f"Kaldıraç: {TP_LEVERAGE}x | Devre kesici: {CIRCUIT_BREAKER_MAX_FAILURES} deneme\n"
+        f"🖥️ Stop VE TP tamamen yazılımsal — borsaya HİÇBİR koşullu emir gönderilmiyor (max {MAX_OPEN_POSITIONS} pozisyon).\n"
+        f"Kaldıraç: {TP_LEVERAGE}x\n"
         f"{len(recovered)} açık pozisyon geri yüklendi.{halt_note}"
     )
     while True:
