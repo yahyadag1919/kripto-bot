@@ -593,6 +593,18 @@ def _close_position(symbol: str, direction: str, qty: float) -> str:
         return str(e)
 
 
+# DERS (2026-07-28): hesap genelindeki borsa stop emri limiti (-4045) dolunca,
+# ayni tur icinde denenecek SONRAKI coinler de ayni sebeple basarisiz olur.
+# Pozisyonu artik kapatmiyoruz (bkz. open_position), ama scan_for_entries'in
+# bosuna yeni girisim denemeyi birakmasi icin hafif bir tur-ici sinyal.
+_stop_limit_reached_this_cycle = False
+
+
+def _mark_stop_limit_reached():
+    global _stop_limit_reached_this_cycle
+    _stop_limit_reached_this_cycle = True
+
+
 # ============================================================
 # INFAZ KATMANI: pozisyon acma
 # ============================================================
@@ -616,6 +628,7 @@ def open_position(symbol: str, direction: str, entry_price: float, atr14: float,
     stop_price = swing_stop
     stop_side = "sell" if direction == "LONG" else "buy"
     stop_order_id = ""
+    stop_missing_at_entry = False
     try:
         stop_order = exchange.create_order(
             symbol, type="STOP_MARKET", side=stop_side, amount=qty,
@@ -623,19 +636,25 @@ def open_position(symbol: str, direction: str, entry_price: float, atr14: float,
         )
         stop_order_id = stop_order.get("id", "")
     except Exception as e:
-        close_err = _close_position(symbol, direction, qty)
-        send_telegram_message(
-            f"⚠️ {symbol}: giriste borsa stop emri konulamadi ({e}) — "
-            f"pozisyon {'kapatildi (guvenlik)' if not close_err else 'KAPATILAMADI, MANUEL KONTROL ET: ' + close_err}."
-        )
-        # DERS (2026-07-28): borsanin stop emri limiti (-4045) dolunca, bu turda
-        # denenecek HER coin ayni sebeple basarisiz olur - watchlist'in geri
-        # kalanini tek tek deneyip her birinde ayri bildirim atmak yuzlerce
-        # spam mesaja yol aciyordu. scan_for_entries'in bunu ayirt edip turu
-        # kesebilmesi icin ayri bir sentinel donduruyoruz.
+        # DERS (2026-07-28): girişte borsa stop emri konulamadigi anda pozisyonu
+        # ANINDA kapatmak asiri tepkiydi - -4045 gibi hatalar Demo Trading'in
+        # bilinen tutarsiz/gecici platform kusurlarindan biri (bkz. proje notlari)
+        # ve cogunlukla tek seferlik. update_positions() zaten devam eden
+        # pozisyonlar icin TAM da bu senaryoya karsi bir hibrit desen icermektedir:
+        # her turda borsa stop'unu yeniden koymayi dener, fiyat stop seviyesini
+        # gectiginde yazilimsal olarak (borsa emri olsun olmasin) kapatir, ve
+        # sadece 3 tur ust uste basarisiz olursa devre kesiciyle zorla kapatir
+        # (missing_count / CIRCUIT_BREAKER_MAX_FAILURES). Girişte de ayni desene
+        # uyup pozisyonu ACIK BIRAKIYORUZ; asagida stop_missing_count=1 ile
+        # kaydediyoruz ki o mekanizma ilk turdan itibaren devam etsin.
+        stop_missing_at_entry = True
+        print(f"{symbol}: giriste borsa stop emri konulamadi ({e}) - pozisyon acik tutuluyor, yazilimsal yedek devrede.")
         if "-4045" in str(e) or "max stop order" in str(e).lower():
-            return "STOP_LIMIT_REACHED"
-        return None
+            # Hesap genelindeki stop emri limiti dolu olabilir - bu turda
+            # denenecek SONRAKI coinler de ayni sebeple basarisiz olur, o yuzden
+            # scan_for_entries'e bu turu erken kesmesi icin sinyal veriyoruz.
+            # (Bu pozisyonu kapatmiyor, sadece taramayi durduruyor.)
+            _mark_stop_limit_reached()
 
     stop_distance = abs(real_entry_price - stop_price)
     partial_tp_price = (real_entry_price + stop_distance * TP_PARTIAL_TP_R_MULT if direction == "LONG"
@@ -663,7 +682,7 @@ def open_position(symbol: str, direction: str, entry_price: float, atr14: float,
         "exchange_stop_order_id": stop_order_id,
         "partial_tp_price": partial_tp_price, "partial_tp_taken": "0",
         "original_qty": qty, "exchange_tp_order_id": tp_order_id,
-        "stop_missing_count": "0",
+        "stop_missing_count": "1" if stop_missing_at_entry else "0",
     })
     _write_positions(rows)
 
@@ -880,6 +899,8 @@ def cleanup_orphaned_orders():
 
 @track_errors
 def scan_for_entries():
+    global _stop_limit_reached_this_cycle
+    _stop_limit_reached_this_cycle = False
     open_symbols = {r["symbol"] for r in _read_positions()}
     if len(open_symbols) >= MAX_OPEN_POSITIONS:
         return
@@ -892,11 +913,11 @@ def scan_for_entries():
             continue
         if len(open_symbols) >= MAX_OPEN_POSITIONS:
             break
-        if margin_exhausted:
-            # Bir kere marjin yetersiz cikinca, ayni turda denenen SONRAKI
-            # her coin de ayni sebeple basarisiz olur - tek tek deneyip her
-            # birinde ayri Dedektif raporu gondermek yerine, bu turu burada
-            # kesiyoruz (2026-07-28, tekrarlanan -2019 spam'ini onlemek icin).
+        if margin_exhausted or _stop_limit_reached_this_cycle:
+            # Bir kere marjin yetersiz ya da borsa stop limiti dolu cikinca,
+            # ayni turda denenen SONRAKI her coin de ayni sebeple basarisiz
+            # olur - tek tek deneyip her birinde ayri Dedektif raporu
+            # gondermek yerine, bu turu burada kesiyoruz (2026-07-28).
             break
         scanned += 1
         try:
@@ -909,10 +930,7 @@ def scan_for_entries():
                 continue
             entry_price, atr14, swing_stop = result
             opened_qty = open_position(symbol, bias, entry_price, atr14, swing_stop)
-            if opened_qty == "STOP_LIMIT_REACHED":
-                margin_exhausted = True
-                print("Borsa stop emri limiti dolu - bu turda baska yeni islem denenmeyecek.")
-            elif opened_qty:
+            if opened_qty:
                 entries += 1
                 open_symbols.add(symbol)
         except Exception as e:
