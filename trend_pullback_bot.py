@@ -2,11 +2,13 @@
 trend_pullback_bot.py
 ======================
 SIFIRDAN TEMIZ KURULUM v2 (2026-07-27, Gemini'nin 4 katmanli mimarisi)
++ TAMIRCI KATMANI (2026-07-28, Gemini ile birlikte, mevcut kod uzerine eklendi)
 
 1. KATMAN: SISTEM DEDEKTIFI (Error Tracker & Profiler)
-2. KATMAN: DEVRE KESICILER VE GUVENLIK
-3. KATMAN: PIYASA BEYNI (Dynamic Market Allocator)
-4. KATMAN: CEKIRDEK STRATEJI MOTORU (Trend-Pullback)
+2. KATMAN: TAMIRCI (Auto-Healer / Self-Healing)
+3. KATMAN: DEVRE KESICILER VE GUVENLIK
+4. KATMAN: PIYASA BEYNI (Dynamic Market Allocator)
+5. KATMAN: CEKIRDEK STRATEJI MOTORU (Trend-Pullback)
 """
 
 import os
@@ -27,12 +29,6 @@ import requests
 # ============================================================
 USE_TESTNET = os.environ.get("TESTNET", "true").lower() == "true"
 
-exchange = ccxt.binanceusdm({
-    "apiKey": os.environ.get("BINANCE_API_KEY"),
-    "secret": os.environ.get("BINANCE_API_SECRET"),
-    "enableRateLimit": True,
-})
-
 
 def _redirect_all_urls_to_demo(urls_node):
     if isinstance(urls_node, dict):
@@ -46,18 +42,41 @@ def _redirect_all_urls_to_demo(urls_node):
     return urls_node
 
 
-if USE_TESTNET:
-    try:
-        exchange.urls["api"] = _redirect_all_urls_to_demo(exchange.urls["api"])
-    except Exception as e:
-        print(f"Demo-fapi URL override uygulanamadi: {e}")
-    try:
-        exchange.options["fetchCurrencies"] = False
-    except Exception:
-        pass
+def _build_exchange():
+    ex = ccxt.binanceusdm({
+        "apiKey": os.environ.get("BINANCE_API_KEY"),
+        "secret": os.environ.get("BINANCE_API_SECRET"),
+        "enableRateLimit": True,
+    })
+    if USE_TESTNET:
+        try:
+            ex.urls["api"] = _redirect_all_urls_to_demo(ex.urls["api"])
+        except Exception as e:
+            print(f"Demo-fapi URL override uygulanamadi: {e}")
+        try:
+            ex.options["fetchCurrencies"] = False
+        except Exception:
+            pass
+    ex.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
+    ex.options.setdefault("fetchOpenOrders", {})["warnWithoutSymbol"] = False
+    return ex
 
-exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
-exchange.options.setdefault("fetchOpenOrders", {})["warnWithoutSymbol"] = False
+
+exchange = _build_exchange()
+
+
+def _reset_exchange_session():
+    # TAMIRCI (2026-07-28): tekrarlanan aglayarn/timeout hatalarinda borsa
+    # baglantisini (ccxt session) sifirdan kurar - eski session'in takilmis
+    # olma ihtimaline karsi.
+    global exchange
+    try:
+        exchange = _build_exchange()
+        print("Tamirci: borsa oturumu sifirlandi.")
+        return True
+    except Exception as e:
+        print(f"Tamirci: borsa oturumu sifirlanamadi ({e})")
+        return False
 
 # ============================================================
 # TELEGRAM
@@ -114,6 +133,60 @@ def process_telegram_updates():
             send_telegram_message(build_regime_message())
 
 
+def _cancel_all_open_orders_for_symbol(symbol: str) -> int:
+    """Bir sembol icin borsadaki TUM acik emirleri iptal eder. Kac emir
+    iptal edildigini dondurur (basarisiz iptaller sessizce atlanir)."""
+    cancelled = 0
+    try:
+        orders = exchange.fetch_open_orders(symbol)
+    except Exception as e:
+        print(f"{symbol}: acik emirler cekilemedi ({e})")
+        return 0
+    for o in orders:
+        try:
+            exchange.cancel_order(o["id"], symbol)
+            cancelled += 1
+        except Exception:
+            pass
+    return cancelled
+
+
+# ============================================================
+# 2. KATMAN: TAMIRCI (Auto-Healer / Self-Healing)
+# ============================================================
+# DERS (2026-07-28, Gemini ile birlikte tasarlandi): Dedektif bir hata
+# bulunca sistem sadece uyarip beklemesin - Tamirci once otomatik onarim
+# dener, basarili olursa akisa kaldigi yerden devam edilir. Sadece Tamirci
+# ayni sorunu CIRCUIT_BREAKER_MAX_FAILURES turda cozemezse mevcut devre
+# kesici (update_positions icinde) pozisyonu kapatir - Tamirci bu mekanizmayi
+# DEGISTIRMIYOR, sadece her turda once bir onarim sansi ekliyor.
+def _is_network_error(e: Exception) -> bool:
+    text = str(e).lower()
+    return (
+        isinstance(e, (ccxt.NetworkError, ccxt.RequestTimeout))
+        or "timeout" in text or "timed out" in text
+        or "connection" in text or "network" in text
+    )
+
+
+def _is_stop_limit_error(e: Exception) -> bool:
+    text = str(e).lower()
+    return "-4045" in text or "max stop order" in text
+
+
+def tamirci_attempt_repair(symbol: str, e: Exception) -> bool:
+    """Hatanin turune gore otomatik onarim dener. Onarim denendiyse True
+    doner (basarili olup olmadigi degil, bir eylem alindigi anlamina gelir);
+    cagiran taraf onarimdan sonra islemi bir kez daha denemelidir."""
+    if _is_stop_limit_error(e):
+        cancelled = _cancel_all_open_orders_for_symbol(symbol)
+        print(f"Tamirci: {symbol} icin {cancelled} hayalet/eski emir temizlendi (-4045 onarim denemesi).")
+        return True
+    if _is_network_error(e):
+        return _reset_exchange_session()
+    return False
+
+
 # ============================================================
 # 1. KATMAN: SISTEM DEDEKTIFI
 # ============================================================
@@ -152,11 +225,15 @@ def track_errors(func):
                 if isinstance(a, str) and "/" in a and "USDT" in a.upper():
                     symbol_guess = a
                     break
+            healed_note = ""
+            if _is_network_error(e):
+                if _reset_exchange_session():
+                    healed_note = "\n🛠️ Tamirci: borsa oturumu sıfırlandı, bir sonraki turda tekrar denenecek."
             send_telegram_message(
                 f"🚨 [DEDEKTİF RAPORU]\n"
                 f"Fonksiyon: {func.__name__} | Konum: {file_line} | Coin: {symbol_guess}\n"
                 f"Hata: {e}\n"
-                f"Tahmini kök neden: {_guess_root_cause(e)}"
+                f"Tahmini kök neden: {_guess_root_cause(e)}{healed_note}"
             )
             print(f"[DEDEKTIF] {func.__name__} ({file_line}, {symbol_guess}): {e}")
             raise
@@ -636,25 +713,38 @@ def open_position(symbol: str, direction: str, entry_price: float, atr14: float,
         )
         stop_order_id = stop_order.get("id", "")
     except Exception as e:
-        # DERS (2026-07-28): girişte borsa stop emri konulamadigi anda pozisyonu
-        # ANINDA kapatmak asiri tepkiydi - -4045 gibi hatalar Demo Trading'in
-        # bilinen tutarsiz/gecici platform kusurlarindan biri (bkz. proje notlari)
-        # ve cogunlukla tek seferlik. update_positions() zaten devam eden
-        # pozisyonlar icin TAM da bu senaryoya karsi bir hibrit desen icermektedir:
-        # her turda borsa stop'unu yeniden koymayi dener, fiyat stop seviyesini
-        # gectiginde yazilimsal olarak (borsa emri olsun olmasin) kapatir, ve
-        # sadece 3 tur ust uste basarisiz olursa devre kesiciyle zorla kapatir
-        # (missing_count / CIRCUIT_BREAKER_MAX_FAILURES). Girişte de ayni desene
-        # uyup pozisyonu ACIK BIRAKIYORUZ; asagida stop_missing_count=1 ile
-        # kaydediyoruz ki o mekanizma ilk turdan itibaren devam etsin.
-        stop_missing_at_entry = True
-        print(f"{symbol}: giriste borsa stop emri konulamadi ({e}) - pozisyon acik tutuluyor, yazilimsal yedek devrede.")
-        if "-4045" in str(e) or "max stop order" in str(e).lower():
-            # Hesap genelindeki stop emri limiti dolu olabilir - bu turda
-            # denenecek SONRAKI coinler de ayni sebeple basarisiz olur, o yuzden
-            # scan_for_entries'e bu turu erken kesmesi icin sinyal veriyoruz.
-            # (Bu pozisyonu kapatmiyor, sadece taramayi durduruyor.)
-            _mark_stop_limit_reached()
+        # TAMIRCI: kapatmadan once bir onarim + tek seferlik yeniden deneme sansi.
+        repaired = tamirci_attempt_repair(symbol, e)
+        if repaired:
+            try:
+                stop_order = exchange.create_order(
+                    symbol, type="STOP_MARKET", side=stop_side, amount=qty,
+                    params={"stopPrice": stop_price, "reduceOnly": True},
+                )
+                stop_order_id = stop_order.get("id", "")
+                send_telegram_message(f"🛠️ [TAMİRCİ DEVREYE GİRDİ] {symbol}: stop emri sorunu giderildi, işleme devam ediliyor.")
+            except Exception as e2:
+                e = e2  # asagidaki mesaj/kayit icin son hatayi kullan
+
+        if not stop_order_id:
+            # DERS (2026-07-28): girişte borsa stop emri konulamadigi anda pozisyonu
+            # ANINDA kapatmak asiri tepkiydi - -4045 gibi hatalar Demo Trading'in
+            # bilinen tutarsiz/gecici platform kusurlarindan biri (bkz. proje notlari)
+            # ve cogunlukla tek seferlik. update_positions() zaten devam eden
+            # pozisyonlar icin TAM da bu senaryoya karsi bir hibrit desen icermektedir:
+            # her turda borsa stop'unu yeniden koymayi dener (Tamirci onariyla
+            # birlikte), fiyat stop seviyesini gectiginde yazilimsal olarak (borsa
+            # emri olsun olmasin) kapatir, ve sadece 3 tur ust uste basarisiz olursa
+            # devre kesiciyle zorla kapatir (missing_count / CIRCUIT_BREAKER_MAX_FAILURES).
+            # Girişte de ayni desene uyup pozisyonu ACIK BIRAKIYORUZ.
+            stop_missing_at_entry = True
+            print(f"{symbol}: giriste borsa stop emri konulamadi ({e}), Tamirci onarimi da yetersiz kaldi - pozisyon acik tutuluyor, yazilimsal yedek devrede.")
+            if _is_stop_limit_error(e):
+                # Hesap genelindeki stop emri limiti dolu olabilir - bu turda
+                # denenecek SONRAKI coinler de ayni sebeple basarisiz olur, o yuzden
+                # scan_for_entries'e bu turu erken kesmesi icin sinyal veriyoruz.
+                # (Bu pozisyonu kapatmiyor, sadece taramayi durduruyor.)
+                _mark_stop_limit_reached()
 
     stop_distance = abs(real_entry_price - stop_price)
     partial_tp_price = (real_entry_price + stop_distance * TP_PARTIAL_TP_R_MULT if direction == "LONG"
@@ -849,12 +939,33 @@ def update_positions():
                         still_open.append(r)
                         continue
                 stop_side = "sell" if direction == "LONG" else "buy"
-                new_stop_order = exchange.create_order(
-                    symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
-                    params={"stopPrice": stop_price, "reduceOnly": True},
-                )
-                r["exchange_stop_order_id"] = new_stop_order.get("id", "")
-                send_telegram_message(f"🛡️ {symbol}: borsa stop emri bulunamadı, yeniden koyuldu ({missing_count}/{CIRCUIT_BREAKER_MAX_FAILURES}).")
+                try:
+                    new_stop_order = exchange.create_order(
+                        symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
+                        params={"stopPrice": stop_price, "reduceOnly": True},
+                    )
+                    r["exchange_stop_order_id"] = new_stop_order.get("id", "")
+                    send_telegram_message(f"🛡️ {symbol}: borsa stop emri bulunamadı, yeniden koyuldu ({missing_count}/{CIRCUIT_BREAKER_MAX_FAILURES}).")
+                except Exception as e:
+                    # TAMIRCI: dogrudan yeniden koyma basarisiz oldu - once onarim
+                    # dene (hayalet emirleri temizle / oturumu sifirla), sonra
+                    # bir kez daha dene. Bu da basarisiz olursa mevcut devre
+                    # kesici sayaci (missing_count, yukarida zaten arttirildi)
+                    # normal akisinda ilerlemeye devam eder.
+                    repaired = tamirci_attempt_repair(symbol, e)
+                    if repaired:
+                        try:
+                            new_stop_order = exchange.create_order(
+                                symbol, type="STOP_MARKET", side=stop_side, amount=live_qty,
+                                params={"stopPrice": stop_price, "reduceOnly": True},
+                            )
+                            r["exchange_stop_order_id"] = new_stop_order.get("id", "")
+                            r["stop_missing_count"] = "0"
+                            send_telegram_message(f"🛠️ [TAMİRCİ DEVREYE GİRDİ] {symbol}: stop emri sorunu giderildi, işleme devam ediliyor.")
+                        except Exception as e2:
+                            print(f"{symbol}: Tamirci onarimindan sonra da stop konulamadi ({e2})")
+                    else:
+                        print(f"{symbol}: stop yeniden koyulamadi, Tamirci bu hata turu icin onarim uygulamadi ({e})")
             else:
                 r["stop_missing_count"] = "0"
         except Exception as e:
@@ -882,19 +993,33 @@ def update_positions():
 
 
 def cleanup_orphaned_orders():
-    tracked_symbols = {r["symbol"] for r in _read_positions()}
+    rows = _read_positions()
+    tracked_symbols = {r["symbol"] for r in rows}
+    # DERS (2026-07-28, Tamirci katmani): eskiden sadece TAKIP EDILMEYEN
+    # semboller temizleniyordu. Ama takip edilen bir sembolde de, eski/iptal
+    # edilmemis bir stop/TP emri (ornegin trailing guncellemesi sirasinda
+    # iptal cagrisi sessizce basarisiz olduysa) borsa tarafinda birikip
+    # hesabin stop emri limitine katkida bulunabilir. Artik takip edilen
+    # semboller icin de, o pozisyonun KAYITLI stop/TP emir ID'leriyle
+    # eslesmeyen HER emri hayalet sayip iptal ediyoruz.
+    known_ids_by_symbol = {}
+    for r in rows:
+        ids = {r.get("exchange_stop_order_id"), r.get("exchange_tp_order_id")}
+        known_ids_by_symbol.setdefault(r["symbol"], set()).update(i for i in ids if i)
+
     for sym in WATCHLIST:
-        if sym in tracked_symbols:
-            continue
         try:
             orders = exchange.fetch_open_orders(sym)
-            for o in orders:
-                try:
-                    exchange.cancel_order(o["id"], sym)
-                except Exception:
-                    pass
         except Exception:
-            pass
+            continue
+        known_ids = known_ids_by_symbol.get(sym, set()) if sym in tracked_symbols else set()
+        for o in orders:
+            if o.get("id") in known_ids:
+                continue
+            try:
+                exchange.cancel_order(o["id"], sym)
+            except Exception:
+                pass
 
 
 @track_errors
@@ -1032,8 +1157,8 @@ def run_forever():
     if NEW_TRADES_HALTED:
         halt_note = "\n\n🛑 YENİ İŞLEM AÇMA YASAĞI AKTİF (NEW_TRADES_HALTED=true)."
     send_telegram_message(
-        f"🚀 Trend-Pullback botu (4 KATMANLI SIFIRDAN KURULUM) başlatıldı.\n"
-        f"1️⃣ Sistem Dedektifi | 2️⃣ Devre Kesiciler | 3️⃣ Piyasa Beyni | 4️⃣ Trend-Pullback\n"
+        f"🚀 Trend-Pullback botu (5 KATMANLI, TAMİRCİ EKLENDİ) başlatıldı.\n"
+        f"1️⃣ Sistem Dedektifi | 2️⃣ Tamirci (Auto-Healer) | 3️⃣ Devre Kesiciler | 4️⃣ Piyasa Beyni | 5️⃣ Trend-Pullback\n"
         f"{len(WATCHLIST)} coin taranıyor. Güncel rejim: {_current_regime} (risk: %{_current_risk_pct})\n"
         f"Hibrit çıkış: %{TP_PARTIAL_CLOSE_PCT} parsiyel TP ({TP_PARTIAL_TP_R_MULT}R) → breakeven → "
         f"kalan %{100-TP_PARTIAL_CLOSE_PCT} için {TP_POST_BREAKEVEN_TRAIL_MULT}×ATR trailing.\n"
