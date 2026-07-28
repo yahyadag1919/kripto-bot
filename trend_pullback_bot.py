@@ -628,6 +628,13 @@ def open_position(symbol: str, direction: str, entry_price: float, atr14: float,
             f"⚠️ {symbol}: giriste borsa stop emri konulamadi ({e}) — "
             f"pozisyon {'kapatildi (guvenlik)' if not close_err else 'KAPATILAMADI, MANUEL KONTROL ET: ' + close_err}."
         )
+        # DERS (2026-07-28): borsanin stop emri limiti (-4045) dolunca, bu turda
+        # denenecek HER coin ayni sebeple basarisiz olur - watchlist'in geri
+        # kalanini tek tek deneyip her birinde ayri bildirim atmak yuzlerce
+        # spam mesaja yol aciyordu. scan_for_entries'in bunu ayirt edip turu
+        # kesebilmesi icin ayri bir sentinel donduruyoruz.
+        if "-4045" in str(e) or "max stop order" in str(e).lower():
+            return "STOP_LIMIT_REACHED"
         return None
 
     stop_distance = abs(real_entry_price - stop_price)
@@ -902,7 +909,10 @@ def scan_for_entries():
                 continue
             entry_price, atr14, swing_stop = result
             opened_qty = open_position(symbol, bias, entry_price, atr14, swing_stop)
-            if opened_qty:
+            if opened_qty == "STOP_LIMIT_REACHED":
+                margin_exhausted = True
+                print("Borsa stop emri limiti dolu - bu turda baska yeni islem denenmeyecek.")
+            elif opened_qty:
                 entries += 1
                 open_symbols.add(symbol)
         except Exception as e:
