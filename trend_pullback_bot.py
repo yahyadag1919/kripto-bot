@@ -250,7 +250,7 @@ DATA_DIR = os.environ.get("DATA_DIR", ".")
 # hatasi aliniyordu. Baslarken klasoru garanti altina aliyoruz.
 os.makedirs(DATA_DIR, exist_ok=True)
 CHECK_INTERVAL_MINUTES = int(os.environ.get("CHECK_INTERVAL_MINUTES", "5"))
-MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "5"))
+MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "3"))
 NEW_TRADES_HALTED = os.environ.get("NEW_TRADES_HALTED", "false").lower() == "true"
 ATR_PERIOD = 14
 
@@ -754,15 +754,17 @@ def open_position(symbol: str, direction: str, entry_price: float, atr14: float,
         partial_qty = float(exchange.amount_to_precision(symbol, partial_qty))
     except Exception:
         pass
+    # DERS (2026-07-28, Gemini'nin nihai mimari karari): TP emri artik borsaya
+    # HIC KOYULMUYOR. Zaten update_positions() her cycle'da partial_tp_price'i
+    # fiyatla karsilastirip gerekirse market emriyle kapatiyordu (asagida
+    # degismedi) - borsadaki TAKE_PROFIT_MARKET emri fiilen hic kullanilmayan,
+    # sadece koşullu emir kapasitesini tuketen fazladan bir emirdi. Kaldirilmasi
+    # -4045'in ana nedeni olan hesap-geneli koşullu emir sayisini yariya
+    # indiriyor (MAX_OPEN_POSITIONS ile birlikte, borsada sadece stop emirleri
+    # kalir). TP guvenlik-kritik degil - bir cycle kacirilsa bile en kotu
+    # ihtimalle kar kilitlenmesi birkac dakika gecikir, pozisyon risk altina
+    # girmez (stop hala borsada/yazilimsal yedekte).
     tp_order_id = ""
-    try:
-        tp_order = exchange.create_order(
-            symbol, type="TAKE_PROFIT_MARKET", side=stop_side, amount=partial_qty,
-            params={"stopPrice": partial_tp_price, "reduceOnly": True},
-        )
-        tp_order_id = tp_order.get("id", "")
-    except Exception as e:
-        print(f"{symbol}: borsa TP emri konulamadi ({e}) - yazilimsal yedek devrede olacak")
 
     rows = _read_positions()
     rows.append({
@@ -781,7 +783,7 @@ def open_position(symbol: str, direction: str, entry_price: float, atr14: float,
         f"Giriş: {real_entry_price:.6f} | Stop: {stop_price:.6f} | "
         f"Parsiyel TP (%{TP_PARTIAL_CLOSE_PCT}, {TP_PARTIAL_TP_R_MULT}R): {partial_tp_price:.6f}\n"
         f"{'✅ Borsa stop aktif' if stop_order_id else '⚠️ Borsa stop KONULAMADI'} | "
-        f"{'✅ Borsa TP aktif' if tp_order_id else '⚠️ Borsa TP KONULAMADI'}\n"
+        f"🖥️ TP yazılımsal takip ediliyor\n"
         f"Kaldıraç: {TP_LEVERAGE}x | Risk: %{_current_risk_pct}"
     )
     return qty
@@ -1160,8 +1162,9 @@ def run_forever():
         f"🚀 Trend-Pullback botu (5 KATMANLI, TAMİRCİ EKLENDİ) başlatıldı.\n"
         f"1️⃣ Sistem Dedektifi | 2️⃣ Tamirci (Auto-Healer) | 3️⃣ Devre Kesiciler | 4️⃣ Piyasa Beyni | 5️⃣ Trend-Pullback\n"
         f"{len(WATCHLIST)} coin taranıyor. Güncel rejim: {_current_regime} (risk: %{_current_risk_pct})\n"
-        f"Hibrit çıkış: %{TP_PARTIAL_CLOSE_PCT} parsiyel TP ({TP_PARTIAL_TP_R_MULT}R) → breakeven → "
+        f"Hibrit çıkış: %{TP_PARTIAL_CLOSE_PCT} parsiyel TP ({TP_PARTIAL_TP_R_MULT}R, 🖥️ tamamen yazılımsal) → breakeven → "
         f"kalan %{100-TP_PARTIAL_CLOSE_PCT} için {TP_POST_BREAKEVEN_TRAIL_MULT}×ATR trailing.\n"
+        f"Borsada sadece stop emri tutulur (max {MAX_OPEN_POSITIONS} pozisyon → en fazla {MAX_OPEN_POSITIONS} koşullu emir).\n"
         f"Kaldıraç: {TP_LEVERAGE}x | Devre kesici: {CIRCUIT_BREAKER_MAX_FAILURES} deneme\n"
         f"{len(recovered)} açık pozisyon geri yüklendi.{halt_note}"
     )
