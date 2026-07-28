@@ -13,11 +13,12 @@ SIFIRDAN TEMIZ KURULUM v2 (2026-07-27, Gemini'nin 4 katmanli mimarisi)
 
 import os
 import csv
+import json
 import sys
 import time
 import traceback
 import functools
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import ccxt
 import numpy as np
@@ -277,6 +278,22 @@ TP_POST_BREAKEVEN_TRAIL_MULT = float(os.environ.get("TP_POST_BREAKEVEN_TRAIL_MUL
 
 CIRCUIT_BREAKER_MAX_FAILURES = int(os.environ.get("CIRCUIT_BREAKER_MAX_FAILURES", "3"))
 
+# ANA PORTFÖY BEYNİ (Master Portfolio Brain) ayarları (2026-07-28, Gemini'nin talebi)
+PORTFOLIO_DAILY_LOSS_LIMIT_PCT = float(os.environ.get("PORTFOLIO_DAILY_LOSS_LIMIT_PCT", "5.0"))
+PORTFOLIO_DAILY_HALT_HOURS = float(os.environ.get("PORTFOLIO_DAILY_HALT_HOURS", "24"))
+PORTFOLIO_CONSEC_LOSS_LIMIT = int(os.environ.get("PORTFOLIO_CONSEC_LOSS_LIMIT", "3"))
+PORTFOLIO_COOLDOWN_HOURS = float(os.environ.get("PORTFOLIO_COOLDOWN_HOURS", "2"))
+PORTFOLIO_RISK_PENALTY_MULT = float(os.environ.get("PORTFOLIO_RISK_PENALTY_MULT", "0.5"))
+# Gemini'nin talebi "%50 risk azalt VEYA 2 saat cooldown" seklinde iki secenek
+# sunuyordu, hangisi net degildi - daha korumaci olan ikisini birlikte
+# uyguluyoruz: 3. arka arkaya STOP'ta hem 2 saatlik giris donmasi (cooldown)
+# hem de cooldown bitince risk %50 dusuk devam eder (bir sonraki kazançlı
+# islem gelene ya da PORTFOLIO_RISK_PENALTY_HOURS dolana kadar).
+PORTFOLIO_RISK_PENALTY_HOURS = float(os.environ.get("PORTFOLIO_RISK_PENALTY_HOURS", "24"))
+PORTFOLIO_PROFIT_RISK_PCT = float(os.environ.get("PORTFOLIO_PROFIT_RISK_PCT", "2.0"))
+PORTFOLIO_LOSS_RISK_PCT = float(os.environ.get("PORTFOLIO_LOSS_RISK_PCT", "0.5"))
+RESET_ON_START = os.environ.get("RESET_ON_START", "false").lower() == "true"
+
 REGIME_ADX_TREND_THRESHOLD = float(os.environ.get("REGIME_ADX_TREND_THRESHOLD", "25"))
 REGIME_ADX_RANGE_THRESHOLD = float(os.environ.get("REGIME_ADX_RANGE_THRESHOLD", "20"))
 REGIME_BENCHMARK_SYMBOL = os.environ.get("REGIME_BENCHMARK_SYMBOL", "BTC/USDT:USDT")
@@ -285,6 +302,7 @@ REGIME_CHECK_EVERY_N_CYCLES = int(os.environ.get("REGIME_CHECK_EVERY_N_CYCLES", 
 REFERENCE_BALANCE_FILE = os.path.join(DATA_DIR, "reference_balance.txt")
 POSITIONS_FILE = os.path.join(DATA_DIR, "positions.csv")
 CLOSED_TRADES_FILE = os.path.join(DATA_DIR, "closed_trades.csv")
+PORTFOLIO_STATE_FILE = os.path.join(DATA_DIR, "portfolio_state.json")
 
 POSITION_FIELDNAMES = [
     "symbol", "direction", "entry_price", "stop_price", "extreme_price", "entry_time",
@@ -564,6 +582,143 @@ def _write_positions(rows):
         writer.writerows(rows)
 
 
+# ============================================================
+# 0. KATMAN: ANA PORTFÖY BEYNİ (Master Portfolio Brain)
+# ============================================================
+# DERS (2026-07-28, Gemini'nin talebi): kullanicinin risk yoneticisi rolunu
+# ustlenen ust katman. Piyasa Beyni'nin (ADX rejimine gore) belirledigi
+# riskin USTUNE, hesabin GENEL SAGLIGINA gore ek kisitlamalar/carpanlar
+# uygular - rejim riskini DEGISTIRMEZ, sadece daha da kisar gerekirse.
+_PORTFOLIO_STATE_DEFAULT = {
+    "day_start_date": None, "day_start_balance": None, "halt_until": None,
+    "consecutive_losses": 0, "cooldown_until": None, "risk_penalty_until": None,
+    "cumulative_pnl_pct": 0.0,
+}
+
+
+def _load_portfolio_state():
+    if os.path.isfile(PORTFOLIO_STATE_FILE):
+        try:
+            with open(PORTFOLIO_STATE_FILE) as f:
+                state = json.load(f)
+            merged = dict(_PORTFOLIO_STATE_DEFAULT)
+            merged.update(state)
+            return merged
+        except Exception as e:
+            print(f"Portföy Beyni: state okunamadi, sifirdan basliyor ({e})")
+    return dict(_PORTFOLIO_STATE_DEFAULT)
+
+
+def _save_portfolio_state(state):
+    try:
+        with open(PORTFOLIO_STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"Portföy Beyni: state kaydedilemedi ({e})")
+
+
+def _portfolio_note_trade_closed(pct_change: float):
+    """Her pozisyon kapanisinda cagrilir - ardisik kayip ve kumulatif PnL takibi."""
+    state = _load_portfolio_state()
+    state["cumulative_pnl_pct"] = state.get("cumulative_pnl_pct", 0.0) + pct_change
+    if pct_change < 0:
+        state["consecutive_losses"] = state.get("consecutive_losses", 0) + 1
+        if state["consecutive_losses"] >= PORTFOLIO_CONSEC_LOSS_LIMIT:
+            now = datetime.now()
+            state["cooldown_until"] = (now + timedelta(hours=PORTFOLIO_COOLDOWN_HOURS)).isoformat()
+            state["risk_penalty_until"] = (now + timedelta(hours=PORTFOLIO_RISK_PENALTY_HOURS)).isoformat()
+            state["consecutive_losses"] = 0
+            send_telegram_message(
+                f"🧠 [Ana Portföy Beyni] Arka arkaya {PORTFOLIO_CONSEC_LOSS_LIMIT} işlem STOP oldu.\n"
+                f"⏸️ {PORTFOLIO_COOLDOWN_HOURS} saat yeni işlem açılmayacak (cooldown).\n"
+                f"⚠️ Sonrasında da {PORTFOLIO_RISK_PENALTY_HOURS} saat boyunca risk %{PORTFOLIO_RISK_PENALTY_MULT*100:.0f} azaltılmış devam edecek."
+            )
+    else:
+        state["consecutive_losses"] = 0
+    _save_portfolio_state(state)
+
+
+def update_portfolio_brain():
+    """Her cycle basi cagrilir - gunluk kayip limiti kontrolu + gun donusu."""
+    state = _load_portfolio_state()
+    try:
+        balance = exchange.fetch_balance()
+        current_balance = balance.get("USDT", {}).get("total") or balance.get("total", {}).get("USDT") or 0
+    except Exception as e:
+        print(f"Portföy Beyni: bakiye cekilemedi ({e})")
+        return state
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    if state.get("day_start_date") != today:
+        state["day_start_date"] = today
+        state["day_start_balance"] = current_balance
+        # Yeni gunde, onceki gunden kalma bir gunluk-kayip donmasi varsa
+        # (ve suresi zaten dolmussa) burada dogal olarak temizlenmis olur;
+        # aktif bir halt suresi hala devam ediyorsa (24 saat dolmadiysa)
+        # asagidaki now < halt_until kontrolu zaten onu koruyacaktir.
+        _save_portfolio_state(state)
+        return state
+
+    day_start = state.get("day_start_balance") or current_balance
+    if day_start:
+        daily_pnl_pct = (current_balance - day_start) / day_start * 100
+        already_halted = bool(state.get("halt_until"))
+        if daily_pnl_pct <= -PORTFOLIO_DAILY_LOSS_LIMIT_PCT and not already_halted:
+            halt_until = datetime.now() + timedelta(hours=PORTFOLIO_DAILY_HALT_HOURS)
+            state["halt_until"] = halt_until.isoformat()
+            send_telegram_message(
+                f"🚨 [Ana Portföy Beyni] Günlük kayıp limiti (%{PORTFOLIO_DAILY_LOSS_LIMIT_PCT}) aşıldı "
+                f"(bugün: %{daily_pnl_pct:.2f}).\n"
+                f"⛔ Yeni işlem açılışları {PORTFOLIO_DAILY_HALT_HOURS} saat boyunca DONDURULDU."
+            )
+    _save_portfolio_state(state)
+    return state
+
+
+def _portfolio_trading_allowed():
+    state = _load_portfolio_state()
+    now = datetime.now()
+    halt_until = state.get("halt_until")
+    if halt_until:
+        try:
+            if now < datetime.fromisoformat(halt_until):
+                return False, "günlük kayıp limiti donması aktif"
+        except Exception:
+            pass
+    cooldown_until = state.get("cooldown_until")
+    if cooldown_until:
+        try:
+            if now < datetime.fromisoformat(cooldown_until):
+                return False, "ardışık kayıp cooldown'u aktif"
+        except Exception:
+            pass
+    return True, ""
+
+
+def _portfolio_risk_multiplier():
+    """Piyasa Beyni'nin belirledigi riske ek olarak uygulanacak carpan (<=1.0)."""
+    state = _load_portfolio_state()
+    mult = 1.0
+    now = datetime.now()
+    risk_penalty_until = state.get("risk_penalty_until")
+    if risk_penalty_until:
+        try:
+            if now < datetime.fromisoformat(risk_penalty_until):
+                mult = min(mult, PORTFOLIO_RISK_PENALTY_MULT)
+        except Exception:
+            pass
+    # Genel portfoy durumu: kumulatif PnL negatifse muhafazakar tavana cek.
+    cumulative = state.get("cumulative_pnl_pct", 0.0)
+    if cumulative < 0 and PORTFOLIO_LOSS_RISK_PCT < PORTFOLIO_PROFIT_RISK_PCT:
+        capped = PORTFOLIO_LOSS_RISK_PCT / PORTFOLIO_PROFIT_RISK_PCT
+        mult = min(mult, capped)
+    return mult
+
+
+def _effective_risk_pct():
+    return _current_risk_pct * _portfolio_risk_multiplier()
+
+
 def log_closed_trade(symbol, direction, entry_price, exit_price, pct_change, reason):
     is_new = not os.path.isfile(CLOSED_TRADES_FILE)
     with open(CLOSED_TRADES_FILE, "a", newline="") as f:
@@ -575,6 +730,10 @@ def log_closed_trade(symbol, direction, entry_price, exit_price, pct_change, rea
             "entry_price": entry_price, "exit_price": exit_price,
             "pct_change": f"{pct_change:.3f}", "reason": reason,
         })
+    try:
+        _portfolio_note_trade_closed(pct_change)
+    except Exception as e:
+        print(f"Portföy Beyni: kapanan islem islenemedi ({e})")
 
 
 def _get_reference_balance():
@@ -593,7 +752,7 @@ def _get_reference_balance():
 
 def _compute_position_size(symbol: str, entry_price: float, stop_price: float) -> float:
     reference_balance = _get_reference_balance()
-    risk_amount = reference_balance * (_current_risk_pct / 100)
+    risk_amount = reference_balance * (_effective_risk_pct() / 100)
     stop_distance = abs(entry_price - stop_price)
     if stop_distance <= 0:
         return 0
@@ -784,7 +943,7 @@ def open_position(symbol: str, direction: str, entry_price: float, atr14: float,
         f"Parsiyel TP (%{TP_PARTIAL_CLOSE_PCT}, {TP_PARTIAL_TP_R_MULT}R): {partial_tp_price:.6f}\n"
         f"{'✅ Borsa stop aktif' if stop_order_id else '⚠️ Borsa stop KONULAMADI'} | "
         f"🖥️ TP yazılımsal takip ediliyor\n"
-        f"Kaldıraç: {TP_LEVERAGE}x | Risk: %{_current_risk_pct}"
+        f"Kaldıraç: {TP_LEVERAGE}x | Risk: %{_effective_risk_pct():.2f}"
     )
     return qty
 
@@ -1028,6 +1187,10 @@ def cleanup_orphaned_orders():
 def scan_for_entries():
     global _stop_limit_reached_this_cycle
     _stop_limit_reached_this_cycle = False
+    allowed, reason = _portfolio_trading_allowed()
+    if not allowed:
+        print(f"Ana Portföy Beyni: yeni işlem açılışı engellendi ({reason}).")
+        return
     open_symbols = {r["symbol"] for r in _read_positions()}
     if len(open_symbols) >= MAX_OPEN_POSITIONS:
         return
@@ -1142,13 +1305,98 @@ def scan_once():
             print(f"Piyasa Beyni guncellenemedi ({e})")
     _regime_cycle_counter += 1
 
+    try:
+        update_portfolio_brain()
+    except Exception as e:
+        print(f"Ana Portföy Beyni guncellenemedi ({e})")
+
     update_positions()
 
     if not NEW_TRADES_HALTED:
         scan_for_entries()
 
 
+def _perform_full_reset():
+    """RESET_ON_START=true oldugunda, run_forever() baslamadan ONCE bir kez
+    cagrilir. Gemini'nin talebi: butun duzeltmeleri (yazilimsal TP, Tamirci,
+    Portfoy Beyni) adil ve temiz sartlarda test etmek icin '0 km' reset.
+    1) Hesaptaki TUM acik pozisyonlari (WATCHLIST disinda kalsa bile) market
+       emriyle kapatir, 2) TUM acik emirleri iptal eder, 3) positions.csv /
+       closed_trades.csv / portfolio_state.json'i sifirlar (veri kaybini
+       onlemek icin eski dosyalari SILMEK yerine zaman damgali yedege tasir),
+       4) referans bakiyeyi 10.000 USDT'ye sifirlar."""
+    print("=== TAM RESET basliyor (RESET_ON_START=true) ===")
+    closed = 0
+    try:
+        positions = exchange.fetch_positions()
+    except Exception as e:
+        positions = []
+        print(f"Reset: acik pozisyonlar cekilemedi ({e})")
+    for p in positions:
+        try:
+            contracts = abs(p.get("contracts") or 0)
+            if contracts <= 0:
+                continue
+            sym = p["symbol"]
+            side = "sell" if (p.get("side") == "long") else "buy"
+            exchange.create_order(sym, type="market", side=side, amount=contracts, params={"reduceOnly": True})
+            closed += 1
+        except Exception as e:
+            print(f"Reset: {p.get('symbol')} kapatilamadi ({e})")
+
+    cancelled_orders = 0
+    symbols_to_check = set(WATCHLIST) | {p.get("symbol") for p in positions if p.get("symbol")}
+    for sym in symbols_to_check:
+        try:
+            for o in exchange.fetch_open_orders(sym):
+                try:
+                    exchange.cancel_order(o["id"], sym)
+                    cancelled_orders += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for f in (POSITIONS_FILE, CLOSED_TRADES_FILE, PORTFOLIO_STATE_FILE):
+        if os.path.isfile(f):
+            try:
+                os.rename(f, f"{f}.reset_{stamp}.bak")
+            except Exception as e:
+                print(f"Reset: {f} yedeklenemedi ({e})")
+
+    try:
+        with open(REFERENCE_BALANCE_FILE, "w") as f:
+            f.write("10000")
+    except Exception as e:
+        print(f"Reset: referans bakiye yazilamadi ({e})")
+
+    env_override_note = ""
+    if os.environ.get("TP_REFERENCE_BALANCE"):
+        env_override_note = (
+            "\n⚠️ TP_REFERENCE_BALANCE env değişkeni hâlâ ayarlı — dosyadaki 10.000 "
+            "yerine onu kullanmaya devam edecek, Railway'den kaldırman gerekebilir."
+        )
+
+    send_telegram_message(
+        f"🔄 [TAM RESET TAMAMLANDI]\n"
+        f"Kapatılan pozisyon: {closed} | İptal edilen emir: {cancelled_orders}\n"
+        f"positions.csv / closed_trades.csv / portfolio_state.json sıfırlandı (eskileri .bak olarak saklandı).\n"
+        f"Referans bakiye: 10.000 USDT.{env_override_note}\n"
+        f"🧠 Ana Portföy Beyni: gün başı bakiyesi, ardışık kayıp sayacı ve cooldown sıfırlandı.\n"
+        f"Sistem '0 km' olarak yeniden başlıyor."
+    )
+    print(f"=== TAM RESET tamamlandi: {closed} pozisyon kapatildi, {cancelled_orders} emir iptal edildi ===")
+
+
 def run_forever():
+    if RESET_ON_START:
+        try:
+            _perform_full_reset()
+        except Exception as e:
+            print(f"TAM RESET basarisiz oldu: {e}")
+            send_telegram_message(f"🚨 TAM RESET başarısız oldu: {e}\nBot yine de normal başlatılıyor, açık pozisyonları manuel kontrol et.")
+
     try:
         update_market_regime()
     except Exception as e:
