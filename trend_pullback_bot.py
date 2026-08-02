@@ -278,11 +278,47 @@ TP_SWING_LOOKBACK = int(os.environ.get("TP_SWING_LOOKBACK", "20"))
 
 TP_LEVERAGE = int(os.environ.get("TP_LEVERAGE", "10"))
 TP_POSITION_PCT_OF_BALANCE = float(os.environ.get("TP_POSITION_PCT_OF_BALANCE", "20"))  # DERS (2026-07-28): risk-bazli miktar hesabinin, dar stop mesafelerinde asiri buyuk notional/marjin talep etmesini onleyen tavan
-TP_RISK_PER_TRADE_PCT = float(os.environ.get("TP_RISK_PER_TRADE_PCT", "2.0"))
-TP_RISK_RANGING_PCT = float(os.environ.get("TP_RISK_RANGING_PCT", "0.5"))
-TP_PARTIAL_CLOSE_PCT = float(os.environ.get("TP_PARTIAL_CLOSE_PCT", "50"))
-TP_PARTIAL_TP_R_MULT = float(os.environ.get("TP_PARTIAL_TP_R_MULT", "1.5"))
-TP_POST_BREAKEVEN_TRAIL_MULT = float(os.environ.get("TP_POST_BREAKEVEN_TRAIL_MULT", "2.0"))
+# DERS (2026-08-02, Gemini): pozisyon basi risk artik rejime gore
+# degismiyor, SABIT %0.5. Piyasa Beyni'nin gorevi risk seviyesini degil
+# hangi MOTORUN calisacagini secmek. Ana Portfoy Beyni bu tabani hala
+# asagi cekebilir (ardisik kayipta yariya indirme) - ama asla yukari cikmaz.
+TP_RISK_PER_TRADE_PCT = float(os.environ.get("TP_RISK_PER_TRADE_PCT", "0.5"))
+TP_RISK_RANGING_PCT = TP_RISK_PER_TRADE_PCT
+# ------------------------------------------------------------
+# ÇIKIŞ KURALLARI (2026-08-02, Gemini'nin nihai karari)
+# ------------------------------------------------------------
+# Breakeven mantigi TAMAMEN KALDIRILDI. Gerekce: M15 gurultusunde stop
+# girise cekildikten sonra fiyat bir kez girise dokunup pozisyonu sifira
+# yakin kapatiyordu; kazanan islemler boylece erken olduruluyor ama
+# kaybedenler tam stop yiyordu - asimetri kasayi eritti.
+# Yerine: SABIT 1:2 R:R. Her islem ya 1R kaybeder ya 2R kazanir.
+# Parsiyel TP ve ATR trailing de bu kararla birlikte kaldirildi.
+TP_RR_RATIO = float(os.environ.get("TP_RR_RATIO", "2.0"))
+
+# ------------------------------------------------------------
+# 3 MOTORLU STRATEJI PARAMETRELERI (2026-08-02)
+# ------------------------------------------------------------
+TP_H4_TIMEFRAME = os.environ.get("TP_H4_TIMEFRAME", "4h")
+
+# A) BREAKOUT MOTORU - Bollinger sikismasi + hacimli kirilim
+BB_PERIOD = int(os.environ.get("BB_PERIOD", "20"))
+BB_STD_MULT = float(os.environ.get("BB_STD_MULT", "2.0"))
+# Bant genisligi (bandwidth) son N mumun en dar %X'inde ise "sikisma" sayilir
+BB_SQUEEZE_LOOKBACK = int(os.environ.get("BB_SQUEEZE_LOOKBACK", "50"))
+BB_SQUEEZE_PERCENTILE = float(os.environ.get("BB_SQUEEZE_PERCENTILE", "25"))
+BREAKOUT_VOLUME_MULT = float(os.environ.get("BREAKOUT_VOLUME_MULT", "1.5"))
+BREAKOUT_VOLUME_MA = int(os.environ.get("BREAKOUT_VOLUME_MA", "20"))
+
+# B) LIKIDITE AVCISI - kanal disina atilan igne + kanala geri kapanis
+LIQ_RANGE_LOOKBACK = int(os.environ.get("LIQ_RANGE_LOOKBACK", "20"))
+# Igne, kanal sinirini en az bu kadar (ATR carpani) asmali ki "tuzak" sayilsin
+LIQ_WICK_MIN_ATR = float(os.environ.get("LIQ_WICK_MIN_ATR", "0.3"))
+# Igne, mumun toplam boyunun en az bu orani olmali (govde degil igne olsun)
+LIQ_WICK_MIN_RATIO = float(os.environ.get("LIQ_WICK_MIN_RATIO", "0.5"))
+
+# C) H4 SWING TREND - M15 gurultusu tamamen yok sayilir
+H4_EMA_PERIOD = int(os.environ.get("H4_EMA_PERIOD", "50"))
+H4_PULLBACK_TOLERANCE_PCT = float(os.environ.get("H4_PULLBACK_TOLERANCE_PCT", "1.0"))
 
 CIRCUIT_BREAKER_MAX_FAILURES = int(os.environ.get("CIRCUIT_BREAKER_MAX_FAILURES", "3"))
 
@@ -313,9 +349,9 @@ CLOSED_TRADES_FILE = os.path.join(DATA_DIR, "closed_trades.csv")
 PORTFOLIO_STATE_FILE = os.path.join(DATA_DIR, "portfolio_state.json")
 
 POSITION_FIELDNAMES = [
-    "symbol", "direction", "entry_price", "stop_price", "extreme_price", "entry_time",
-    "exchange_stop_order_id", "partial_tp_price", "partial_tp_taken", "original_qty",
-    "exchange_tp_order_id", "stop_missing_count",
+    "symbol", "direction", "entry_price", "stop_price", "tp_price", "entry_time",
+    "engine", "original_qty", "exchange_stop_order_id", "exchange_tp_order_id",
+    "stop_missing_count",
 ]
 CLOSED_TRADE_FIELDNAMES = ["timestamp", "symbol", "direction", "entry_price", "exit_price", "pct_change", "reason"]
 
@@ -444,6 +480,18 @@ def _compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return adx
 
 
+def _compute_bollinger(df: pd.DataFrame, period: int = BB_PERIOD, mult: float = BB_STD_MULT):
+    """(orta, ust, alt, bant_genisligi) doner. Bant genisligi orta banda
+    oranlanmis yuzde - farkli fiyat seviyelerindeki coinleri karsilastirmayi
+    mumkun kilar (BTC ile SHIB ayni olcekte degerlendirilebilsin)."""
+    mid = df["close"].rolling(period).mean()
+    std = df["close"].rolling(period).std()
+    upper = mid + std * mult
+    lower = mid - std * mult
+    width = (upper - lower) / mid.replace(0, np.nan) * 100
+    return mid, upper, lower, width
+
+
 def fetch_df(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -510,63 +558,202 @@ def build_regime_message():
 
 
 # ============================================================
-# 4. KATMAN: STRATEJI MOTORU
+# 4. KATMAN: 3 MOTORLU STRATEJI (2026-08-02, Gemini'nin karari)
 # ============================================================
-@track_errors
-def get_h1_trend_bias(symbol: str):
-    try:
-        df = fetch_df(symbol, TP_H1_TIMEFRAME, TP_EMA200_PERIOD + 50)
-    except Exception:
-        return None
-    if len(df) < TP_EMA200_PERIOD + 5:
-        return None
-    df["ema200"] = df["close"].ewm(span=TP_EMA200_PERIOD, adjust=False).mean()
-    df["supertrend"] = _compute_supertrend(df, TP_SUPERTREND_PERIOD, TP_SUPERTREND_MULT)
-    row = df.iloc[-2]
-    if pd.isna(row["ema200"]) or row["supertrend"] is None:
-        return None
-    if row["close"] > row["ema200"] and row["supertrend"] == "YESIL":
-        return "LONG"
-    if row["close"] < row["ema200"] and row["supertrend"] == "KIRMIZI":
-        return "SHORT"
-    return None
+# Eski tek strateji (H1 trend + M15 pullback) M15 gurultusunde kasa
+# eritdigi icin kaldirildi. Yerine, Piyasa Beyni'nin rejime gore
+# tetikledigi 3 bagimsiz motor geldi. Her motor ayni sozlesmeyi doner:
+#   (direction, entry_price, stop_price, engine_adi)  ya da  None
+# Stop'u her motor KENDI mantigina gore belirler; TP her zaman
+# open_position icinde 1:2 R:R olarak hesaplanir (motorlar TP belirlemez).
 
 
+def _engine_result(direction, entry, stop, name):
+    """Ortak dogrulama: stop yanlis tarafta ya da sifir mesafedeyse sinyali
+    iptal et. Bu kontrol olmadan bozuk bir stop, 1:2 R:R hesabini ve
+    pozisyon boyutunu sacmalastirirdi (sifira bolme / devasa miktar)."""
+    if entry is None or stop is None:
+        return None
+    if direction == "LONG" and stop >= entry:
+        return None
+    if direction == "SHORT" and stop <= entry:
+        return None
+    if abs(entry - stop) / entry < 0.0005:  # %0.05'ten dar stop = gurultu
+        return None
+    return direction, float(entry), float(stop), name
+
+
+# ------------------------------------------------------------
+# A) BREAKOUT MOTORU - Sikisma Patlamasi
+# ------------------------------------------------------------
 @track_errors
-def detect_pullback_entry(symbol: str, bias: str):
+def engine_breakout(symbol: str):
+    """Bollinger bantlari daraldiginda (squeeze) aktif olur; fiyat bandi
+    ortalamanin BREAKOUT_VOLUME_MULT katı hacimle kirdigi yone girer."""
     try:
-        df = fetch_df(symbol, TP_M15_TIMEFRAME, max(TP_EMA_SLOW, TP_SWING_LOOKBACK) + 50)
+        df = fetch_df(symbol, TP_M15_TIMEFRAME, BB_SQUEEZE_LOOKBACK + BB_PERIOD + 30)
     except Exception:
         return None
-    if len(df) < TP_EMA_SLOW + 5:
+    if len(df) < BB_SQUEEZE_LOOKBACK + BB_PERIOD + 5:
         return None
-    df["ema_fast"] = df["close"].ewm(span=TP_EMA_FAST, adjust=False).mean()
-    df["ema_slow"] = df["close"].ewm(span=TP_EMA_SLOW, adjust=False).mean()
-    df["rsi"] = _compute_rsi(df["close"], TP_RSI_PERIOD)
+
+    mid, upper, lower, width = _compute_bollinger(df)
+    df["bb_mid"], df["bb_up"], df["bb_low"], df["bb_width"] = mid, upper, lower, width
+    df["vol_ma"] = df["volume"].rolling(BREAKOUT_VOLUME_MA).mean()
     df["atr14"] = _compute_atr(df, ATR_PERIOD)
 
+    # -2: son KAPANMIS mum (canli mum -1'de, ona asla guvenmiyoruz)
     row = df.iloc[-2]
-    if pd.isna(row["ema_fast"]) or pd.isna(row["ema_slow"]) or pd.isna(row["rsi"]) or pd.isna(row["atr14"]):
+    if any(pd.isna(row[c]) for c in ("bb_up", "bb_low", "bb_width", "vol_ma", "atr14")):
         return None
 
-    tol = row["close"] * (TP_PULLBACK_TOLERANCE_PCT / 100)
-    touched_fast = abs(row["low"] - row["ema_fast"]) <= tol or abs(row["high"] - row["ema_fast"]) <= tol
-    touched_slow = abs(row["low"] - row["ema_slow"]) <= tol or abs(row["high"] - row["ema_slow"]) <= tol
-    touched_ema = touched_fast or touched_slow
+    # SIKISMA: kirilim mumunun ONCESINDEKI bant genisligi dar olmali.
+    # Kirilim mumunun kendi genisligine bakmak yanlis olurdu - patlama
+    # aninda bantlar zaten aciliyor.
+    prior_width = df["bb_width"].iloc[-(BB_SQUEEZE_LOOKBACK + 2):-2]
+    if prior_width.isna().all():
+        return None
+    threshold = np.nanpercentile(prior_width.dropna(), BB_SQUEEZE_PERCENTILE)
+    was_squeezed = df["bb_width"].iloc[-3] <= threshold
+    if not was_squeezed:
+        return None
 
-    if bias == "LONG":
-        confirm_candle = row["close"] > row["open"]
-        rsi_ok = row["rsi"] < TP_RSI_LONG_MAX
-        if touched_ema and rsi_ok and confirm_candle:
-            swing_low = df.iloc[-2 - TP_SWING_LOOKBACK:-2]["low"].min()
-            return row["close"], row["atr14"], swing_low
-    else:
-        confirm_candle = row["close"] < row["open"]
-        rsi_ok = row["rsi"] > TP_RSI_SHORT_MIN
-        if touched_ema and rsi_ok and confirm_candle:
-            swing_high = df.iloc[-2 - TP_SWING_LOOKBACK:-2]["high"].max()
-            return row["close"], row["atr14"], swing_high
+    if row["volume"] < row["vol_ma"] * BREAKOUT_VOLUME_MULT:
+        return None
+
+    atr = float(row["atr14"])
+    # KRITIK: kirilimi, kirilim mumunun KENDI bandiyla degil, BIR ONCEKI
+    # mumun bandiyla karsilastiriyoruz. Aksi halde patlama mumunun kendi
+    # oynakligi bandi genisletir ve fiyat kendi bandini neredeyse hicbir
+    # zaman asamaz - kosul pratikte hic tetiklenmezdi.
+    prev_up = df["bb_up"].iloc[-3]
+    prev_low = df["bb_low"].iloc[-3]
+    if pd.isna(prev_up) or pd.isna(prev_low):
+        return None
+
+    if row["close"] > prev_up:
+        # Stop: kirilim mumunun dibinin biraz altina (yanlis kirilim korumasi)
+        return _engine_result("LONG", row["close"], row["low"] - atr * 0.5, "BREAKOUT")
+    if row["close"] < prev_low:
+        return _engine_result("SHORT", row["close"], row["high"] + atr * 0.5, "BREAKOUT")
     return None
+
+
+# ------------------------------------------------------------
+# B) LIKIDITE AVCISI - Fakeout / Igne Avcisi
+# ------------------------------------------------------------
+@track_errors
+def engine_liquidity_hunt(symbol: str):
+    """Yatay piyasada, kanal disina atilan igneden sonra fiyat kanal icine
+    geri kapandiysa TUZAK YONUNDE (ignenin tersine) girer."""
+    try:
+        df = fetch_df(symbol, TP_M15_TIMEFRAME, LIQ_RANGE_LOOKBACK + 60)
+    except Exception:
+        return None
+    if len(df) < LIQ_RANGE_LOOKBACK + 10:
+        return None
+
+    df["atr14"] = _compute_atr(df, ATR_PERIOD)
+    row = df.iloc[-2]
+    if pd.isna(row["atr14"]):
+        return None
+    atr = float(row["atr14"])
+
+    # Kanal, IGNE MUMUNDAN ONCEKI mumlarla hesaplanir - igne mumunu dahil
+    # etmek kanali kendi kendine genisletir ve tuzagi gorunmez yapardi.
+    window = df.iloc[-(LIQ_RANGE_LOOKBACK + 2):-2]
+    if window.empty:
+        return None
+    range_high = float(window["high"].max())
+    range_low = float(window["low"].min())
+    if range_high <= range_low:
+        return None
+
+    candle_range = float(row["high"] - row["low"])
+    if candle_range <= 0:
+        return None
+
+    # Ust igne: kanal tepesinin uzerine tasip ICERIDE kapanmis -> SHORT tuzagi
+    upper_wick = float(row["high"] - max(row["close"], row["open"]))
+    if (row["high"] > range_high + atr * LIQ_WICK_MIN_ATR
+            and row["close"] < range_high
+            and upper_wick / candle_range >= LIQ_WICK_MIN_RATIO):
+        return _engine_result("SHORT", row["close"], row["high"] + atr * 0.2, "LIKIDITE")
+
+    # Alt igne: kanal dibinin altina tasip ICERIDE kapanmis -> LONG tuzagi
+    lower_wick = float(min(row["close"], row["open"]) - row["low"])
+    if (row["low"] < range_low - atr * LIQ_WICK_MIN_ATR
+            and row["close"] > range_low
+            and lower_wick / candle_range >= LIQ_WICK_MIN_RATIO):
+        return _engine_result("LONG", row["close"], row["low"] - atr * 0.2, "LIKIDITE")
+    return None
+
+
+# ------------------------------------------------------------
+# C) H4 SWING TREND MOTORU
+# ------------------------------------------------------------
+@track_errors
+def engine_h4_swing(symbol: str):
+    """Guclu trendde aktif. M15'e HIC BAKMAZ - yon H4'ten, giris zamanlamasi
+    H1'den gelir. Amac M15 gurultusunden tamamen kacinmak."""
+    try:
+        h4 = fetch_df(symbol, TP_H4_TIMEFRAME, H4_EMA_PERIOD + 40)
+    except Exception:
+        return None
+    if len(h4) < H4_EMA_PERIOD + 5:
+        return None
+
+    h4["ema"] = h4["close"].ewm(span=H4_EMA_PERIOD, adjust=False).mean()
+    h4["supertrend"] = _compute_supertrend(h4, TP_SUPERTREND_PERIOD, TP_SUPERTREND_MULT)
+    h4_row = h4.iloc[-2]
+    if pd.isna(h4_row["ema"]):
+        return None
+
+    if h4_row["close"] > h4_row["ema"] and h4_row["supertrend"] == "YESIL":
+        bias = "LONG"
+    elif h4_row["close"] < h4_row["ema"] and h4_row["supertrend"] == "KIRMIZI":
+        bias = "SHORT"
+    else:
+        return None
+
+    # Giris: H1'de ana trend yonunde EMA'ya geri cekilme + teyit mumu
+    try:
+        h1 = fetch_df(symbol, TP_H1_TIMEFRAME, TP_EMA_SLOW + 60)
+    except Exception:
+        return None
+    if len(h1) < TP_EMA_SLOW + 5:
+        return None
+
+    h1["ema_fast"] = h1["close"].ewm(span=TP_EMA_FAST, adjust=False).mean()
+    h1["atr14"] = _compute_atr(h1, ATR_PERIOD)
+    row = h1.iloc[-2]
+    if pd.isna(row["ema_fast"]) or pd.isna(row["atr14"]):
+        return None
+
+    atr = float(row["atr14"])
+    tol = float(row["close"]) * (H4_PULLBACK_TOLERANCE_PCT / 100)
+    near_ema = abs(float(row["low"]) - float(row["ema_fast"])) <= tol or \
+               abs(float(row["high"]) - float(row["ema_fast"])) <= tol
+
+    if bias == "LONG" and near_ema and row["close"] > row["open"]:
+        swing_low = float(h1.iloc[-(TP_SWING_LOOKBACK + 2):-2]["low"].min())
+        return _engine_result("LONG", row["close"], min(swing_low, float(row["low"])) - atr * 0.3, "H4_SWING")
+    if bias == "SHORT" and near_ema and row["close"] < row["open"]:
+        swing_high = float(h1.iloc[-(TP_SWING_LOOKBACK + 2):-2]["high"].max())
+        return _engine_result("SHORT", row["close"], max(swing_high, float(row["high"])) + atr * 0.3, "H4_SWING")
+    return None
+
+
+def active_engines():
+    """Piyasa Beyni'nin rejimine gore hangi motorlarin calisacagini secer.
+    BREAKOUT her rejimde aday - cunku sikisma tespiti coin BAZINDA yapilir,
+    global rejimden bagimsizdir (BTC trenddeyken bir altcoin sikisiyor
+    olabilir). Diger ikisi birbirinin zitti oldugu icin rejime baglidir."""
+    if _current_regime == "TREND":
+        return [engine_h4_swing, engine_breakout]
+    if _current_regime == "YATAY":
+        return [engine_liquidity_hunt, engine_breakout]
+    return [engine_breakout]
 
 
 # ============================================================
@@ -578,8 +765,20 @@ def _read_positions():
     with open(POSITIONS_FILE, newline="") as f:
         rows = list(csv.DictReader(f))
     for r in rows:
-        r.setdefault("partial_tp_taken", "0")
         r.setdefault("stop_missing_count", "0")
+        r.setdefault("engine", "?")
+        # Eski semada (parsiyel TP'li donem) yazilmis satirlar tp_price
+        # icermiyor - bunlari 1:2 R:R'ye gore tamamliyoruz ki eski bir
+        # pozisyon acikken yapilan deploy sonrasi kod cokmesin.
+        if not r.get("tp_price"):
+            try:
+                entry = float(r["entry_price"])
+                stop = float(r["stop_price"])
+                dist = abs(entry - stop)
+                r["tp_price"] = str(entry + dist * TP_RR_RATIO if r["direction"] == "LONG"
+                                    else entry - dist * TP_RR_RATIO)
+            except Exception:
+                r["tp_price"] = ""
     return rows
 
 
@@ -853,11 +1052,11 @@ def _mark_stop_limit_reached():
 # INFAZ KATMANI: pozisyon acma
 # ============================================================
 @track_errors
-def open_position(symbol: str, direction: str, entry_price: float, atr14: float, swing_stop: float):
+def open_position(symbol: str, direction: str, entry_price: float, stop_price: float, engine: str):
     _set_leverage_safe(symbol)
     side = "buy" if direction == "LONG" else "sell"
 
-    qty = _compute_position_size(symbol, entry_price, swing_stop)
+    qty = _compute_position_size(symbol, entry_price, stop_price)
     if qty <= 0:
         return None
 
@@ -880,36 +1079,31 @@ def open_position(symbol: str, direction: str, entry_price: float, atr14: float,
     # cakilir/gecikirse/Railway yeniden baslarsa, o sure boyunca pozisyon
     # HICBIR koruma altinda degildir. Bu tradeoff Gemini'ye acikca sorulup
     # onaylanmisti (rapor 2, soru 3).
-    stop_price = swing_stop
-    stop_order_id = ""
-
+    # SABIT 1:2 R:R (2026-08-02): stop mesafesi motorun belirledigi seviyeden
+    # gelir, TP her zaman bunun TP_RR_RATIO kati. Breakeven / parsiyel TP /
+    # trailing YOK - pozisyon ya stop'a ya TP'ye gider.
+    # ONEMLI: R mesafesini GERCEKLESEN giris fiyatina gore degil, sinyal
+    # anindaki planlanan stop mesafesine gore olcuyoruz olsaydik slippage
+    # R:R'yi bozardi; bu yuzden gerceklesen giristen yeniden hesapliyoruz.
     stop_distance = abs(real_entry_price - stop_price)
-    partial_tp_price = (real_entry_price + stop_distance * TP_PARTIAL_TP_R_MULT if direction == "LONG"
-                         else real_entry_price - stop_distance * TP_PARTIAL_TP_R_MULT)
-    partial_qty = qty * (TP_PARTIAL_CLOSE_PCT / 100)
-    try:
-        partial_qty = float(exchange.amount_to_precision(symbol, partial_qty))
-    except Exception:
-        pass
-    # TP emri de (2026-07-28'den beri) borsaya hic koyulmuyor - asagida degismedi.
-    tp_order_id = ""
+    tp_price = (real_entry_price + stop_distance * TP_RR_RATIO if direction == "LONG"
+                else real_entry_price - stop_distance * TP_RR_RATIO)
 
     rows = _read_positions()
     rows.append({
         "symbol": symbol, "direction": direction,
-        "entry_price": real_entry_price, "stop_price": stop_price, "extreme_price": real_entry_price,
+        "entry_price": real_entry_price, "stop_price": stop_price,
+        "tp_price": tp_price,
         "entry_time": datetime.now().isoformat(),
-        "exchange_stop_order_id": stop_order_id,
-        "partial_tp_price": partial_tp_price, "partial_tp_taken": "0",
-        "original_qty": qty, "exchange_tp_order_id": tp_order_id,
+        "engine": engine, "original_qty": qty,
+        "exchange_stop_order_id": "", "exchange_tp_order_id": "",
         "stop_missing_count": "0",
     })
     _write_positions(rows)
 
     send_telegram_message(
-        f"📈 {symbol} {direction} pozisyon açıldı (H1 trend + M15 pullback) [Rejim: {_current_regime}].\n"
-        f"Giriş: {real_entry_price:.6f} | Stop: {stop_price:.6f} | "
-        f"Parsiyel TP (%{TP_PARTIAL_CLOSE_PCT}, {TP_PARTIAL_TP_R_MULT}R): {partial_tp_price:.6f}\n"
+        f"📈 {symbol} {direction} pozisyon açıldı — motor: {engine} [Rejim: {_current_regime}].\n"
+        f"Giriş: {real_entry_price:.6f} | 🛑 Stop: {stop_price:.6f} | 🎯 TP (1:{TP_RR_RATIO:g}): {tp_price:.6f}\n"
         f"🖥️ Stop VE TP tamamen yazılımsal takip ediliyor (borsaya koşullu emir gönderilmiyor)\n"
         f"Kaldıraç: {TP_LEVERAGE}x | Risk: %{_effective_risk_pct():.2f}"
     )
@@ -930,10 +1124,11 @@ def update_positions():
         direction = r["direction"]
         entry_price = float(r["entry_price"])
         stop_price = float(r["stop_price"])
-        extreme_price = float(r["extreme_price"])
-        partial_tp_taken = r.get("partial_tp_taken", "0") == "1"
-        partial_tp_price = float(r["partial_tp_price"]) if r.get("partial_tp_price") else None
-        original_qty = float(r["original_qty"]) if r.get("original_qty") else None
+        engine = r.get("engine", "?")
+        try:
+            tp_price = float(r["tp_price"]) if r.get("tp_price") else None
+        except (TypeError, ValueError):
+            tp_price = None
 
         try:
             positions = exchange.fetch_positions([symbol])
@@ -954,10 +1149,10 @@ def update_positions():
                 exit_price = entry_price
             raw_pct = (exit_price - entry_price) / entry_price * 100
             pct_change = raw_pct if direction == "LONG" else -raw_pct
-            reason = "Breakeven/Trailing (borsa tetikledi)" if partial_tp_taken else "Stop/TP (borsa tetikledi)"
-            log_closed_trade(symbol, direction, entry_price, exit_price, pct_change, reason)
+            log_closed_trade(symbol, direction, entry_price, exit_price, pct_change,
+                             f"Borsa tetikledi ({engine})")
             send_telegram_message(
-                f"🔔 {symbol} {direction} pozisyon KAPANDI ({reason}).\n"
+                f"🔔 {symbol} {direction} pozisyon KAPANDI (borsa tetikledi, motor: {engine}).\n"
                 f"Giriş: {entry_price:.6f} | Çıkış (yaklaşık): {exit_price:.6f} | Değişim: {pct_change:+.2f}%"
             )
             continue
@@ -968,75 +1163,30 @@ def update_positions():
             still_open.append(r)
             continue
 
-        if not partial_tp_taken and partial_tp_price is not None:
-            tp_hit = (price >= partial_tp_price) if direction == "LONG" else (price <= partial_tp_price)
-            if tp_hit:
-                partial_qty = original_qty * (TP_PARTIAL_CLOSE_PCT / 100) if original_qty else live_qty * 0.5
-                if live_qty > partial_qty * 0.9:
-                    try:
-                        close_side = "sell" if direction == "LONG" else "buy"
-                        exchange.create_order(symbol, type="market", side=close_side,
-                                               amount=min(partial_qty, live_qty), params={"reduceOnly": True})
-                    except Exception as e:
-                        print(f"{symbol}: parsiyel TP kapatma basarisiz ({e})")
-                        still_open.append(r)
-                        continue
+        # SABIT 1:2 R:R (2026-08-02): breakeven / parsiyel TP / trailing
+        # mantiginin TAMAMI kaldirildi. Pozisyon ya stop'a ya TP'ye gider.
+        # STOP once kontrol edilir: ayni cycle'da her iki seviye de asilmis
+        # gorunuyorsa (fiyat sicramasi / bot gecikmesi) kotu senaryoyu
+        # varsaymak dogru olan - aksi halde gercekte stop olmus bir islemi
+        # kazanc olarak kaydedebilirdik.
+        stop_hit = (price <= stop_price) if direction == "LONG" else (price >= stop_price)
+        tp_hit = (tp_price is not None and
+                  ((price >= tp_price) if direction == "LONG" else (price <= tp_price)))
 
-                r["partial_tp_taken"] = "1"
-                r["stop_price"] = str(entry_price)
-                r["extreme_price"] = str(entry_price)
-                # DERS (2026-07-28): borsada stop emri olmadigi icin burada
-                # sadece yazilimsal stop_price guncelleniyor - artik iptal/
-                # yeniden-koy borsa cagrisi yok.
-
-                raw_pct = (price - entry_price) / entry_price * 100
-                pct_change = raw_pct if direction == "LONG" else -raw_pct
-                send_telegram_message(
-                    f"💰 {symbol} {direction}: %{TP_PARTIAL_CLOSE_PCT} parsiyel TP alındı "
-                    f"({TP_PARTIAL_TP_R_MULT}R, {pct_change:+.2f}%). Stop girişe (breakeven) çekildi."
-                )
-                still_open.append(r)
-                continue
-
-        if partial_tp_taken:
-            try:
-                df = fetch_df(symbol, TP_M15_TIMEFRAME, 60)
-                df["atr14"] = _compute_atr(df, ATR_PERIOD)
-                latest_atr = df.iloc[-2]["atr14"]
-            except Exception as e:
-                print(f"{symbol}: ATR guncellenemedi ({e})")
-                still_open.append(r)
-                continue
-
-            if not pd.isna(latest_atr):
-                if direction == "LONG":
-                    new_extreme = max(extreme_price, price)
-                    new_stop = max(stop_price, new_extreme - latest_atr * TP_POST_BREAKEVEN_TRAIL_MULT)
-                else:
-                    new_extreme = min(extreme_price, price)
-                    new_stop = min(stop_price, new_extreme + latest_atr * TP_POST_BREAKEVEN_TRAIL_MULT)
-                if new_stop != stop_price:
-                    r["stop_price"] = str(new_stop)
-                    r["extreme_price"] = str(new_extreme)
-                    stop_price = new_stop
-                    # DERS (2026-07-28): borsa emri yok - trailing sadece
-                    # yazilimsal stop_price'i guncelliyor, borsa cagrisi yok.
-
-        # DERS (2026-07-28, Gemini'nin nihai karari): borsa STOP_MARKET emri
-        # artik hic koyulmadigi icin, "borsa stop'u kayip mi / yeniden koy /
-        # 3 turda devre kesici" mantiginin tamami kaldirildi. Tek koruma
-        # katmani artik hemen asagidaki yazilimsal breach-check.
-
-        breached = (price <= stop_price) if direction == "LONG" else (price >= stop_price)
-        if breached:
+        if stop_hit or tp_hit:
             close_err = _close_position(symbol, direction, live_qty)
             raw_pct = (price - entry_price) / entry_price * 100
             pct_change = raw_pct if direction == "LONG" else -raw_pct
             if not close_err:
-                reason = "Breakeven/Trailing" if partial_tp_taken else "Stop (yazılımsal)"
+                if stop_hit:
+                    reason = f"Stop (yazılımsal, {engine})"
+                    emoji, baslik = "🛑", "STOP"
+                else:
+                    reason = f"TP 1:{TP_RR_RATIO:g} (yazılımsal, {engine})"
+                    emoji, baslik = "🎯", "HEDEF (TP)"
                 log_closed_trade(symbol, direction, entry_price, price, pct_change, reason)
                 send_telegram_message(
-                    f"📉 {symbol} {direction} pozisyon kapandı ({reason}). "
+                    f"{emoji} {symbol} {direction} pozisyon kapandı — {baslik} | motor: {engine}\n"
                     f"Giriş: {entry_price:.6f} | Çıkış: {price:.6f} | Değişim: {pct_change:+.2f}%"
                 )
             else:
@@ -1106,15 +1256,20 @@ def scan_for_entries():
             break
         scanned += 1
         try:
-            bias = get_h1_trend_bias(symbol)
-            if bias is None:
+            # Motorlar sirayla denenir; ILK sinyal veren kazanir. Sira
+            # active_engines() tarafindan belirlenir - rejime en uygun motor
+            # basta. Ayni coinde iki motoru birden acmak, ayni riski iki kez
+            # almak demek olurdu.
+            result = None
+            for engine_fn in active_engines():
+                result = engine_fn(symbol)
+                if result:
+                    break
+            if not result:
                 continue
             trend_found += 1
-            result = detect_pullback_entry(symbol, bias)
-            if result is None:
-                continue
-            entry_price, atr14, swing_stop = result
-            opened_qty = open_position(symbol, bias, entry_price, atr14, swing_stop)
+            direction, entry_price, stop_price, engine_name = result
+            opened_qty = open_position(symbol, direction, entry_price, stop_price, engine_name)
             if opened_qty:
                 entries += 1
                 open_symbols.add(symbol)
@@ -1124,7 +1279,9 @@ def scan_for_entries():
                 margin_exhausted = True
                 print("Marjin tukendigi tespit edildi - bu turda baska yeni islem denenmeyecek.")
 
-    print(f"Tur özeti: rejim={_current_regime} | taranan={scanned} | H1 trend bulundu={trend_found} | açılan={entries}")
+    engines = ", ".join(f.__name__ for f in active_engines())
+    print(f"Tur özeti: rejim={_current_regime} | aktif motorlar={engines} | "
+          f"taranan={scanned} | sinyal={trend_found} | açılan={entries}")
 
 
 # ============================================================
@@ -1137,8 +1294,8 @@ def build_positions_message():
     lines = [f"📋 {len(rows)} açık pozisyon:"]
     for r in rows:
         lines.append(
-            f"  {r['symbol']} {r['direction']} | Giriş: {r['entry_price']} | Stop: {r['stop_price']} | "
-            f"Parsiyel TP alındı: {'Evet' if r.get('partial_tp_taken') == '1' else 'Hayır'}"
+            f"  {r['symbol']} {r['direction']} [{r.get('engine', '?')}] | Giriş: {r['entry_price']} | "
+            f"🛑 {r['stop_price']} | 🎯 {r.get('tp_price', '?')}"
         )
     return "\n".join(lines)
 
@@ -1302,11 +1459,13 @@ def run_forever():
     if NEW_TRADES_HALTED:
         halt_note = "\n\n🛑 YENİ İŞLEM AÇMA YASAĞI AKTİF (NEW_TRADES_HALTED=true)."
     send_telegram_message(
-        f"🚀 Trend-Pullback botu (ZERO EXCHANGE ORDERS mimarisi) başlatıldı.\n"
-        f"1️⃣ Sistem Dedektifi | 2️⃣ Tamirci (Auto-Healer) | 3️⃣ Piyasa Beyni | 4️⃣ Trend-Pullback\n"
-        f"{len(WATCHLIST)} coin taranıyor. Güncel rejim: {_current_regime} (risk: %{_current_risk_pct})\n"
-        f"Hibrit çıkış: %{TP_PARTIAL_CLOSE_PCT} parsiyel TP ({TP_PARTIAL_TP_R_MULT}R) → breakeven → "
-        f"kalan %{100-TP_PARTIAL_CLOSE_PCT} için {TP_POST_BREAKEVEN_TRAIL_MULT}×ATR trailing.\n"
+        f"🚀 Kripto bot (3 MOTORLU MİMARİ + ZERO EXCHANGE ORDERS) başlatıldı.\n"
+        f"0️⃣ Portföy Beyni | 1️⃣ Sistem Dedektifi | 2️⃣ Tamirci | 3️⃣ Piyasa Beyni (motor seçici) | 4️⃣ 3 Strateji Motoru\n"
+        f"{len(WATCHLIST)} coin taranıyor. Güncel rejim: {_current_regime}\n"
+        f"⚙️ Motorlar: A) Breakout (BB sıkışma + {BREAKOUT_VOLUME_MULT}× hacim) | "
+        f"B) Likidite Avcısı (iğne tuzağı, YATAY'da) | C) H4 Swing Trend (TREND'de, M15 yok sayılır)\n"
+        f"🎯 Çıkış: SABİT 1:{TP_RR_RATIO:g} R:R — breakeven/parsiyel TP/trailing YOK.\n"
+        f"💰 Sabit risk: %{TP_RISK_PER_TRADE_PCT} (Portföy Beyni gerekirse daha da kısar)\n"
         f"🖥️ Stop VE TP tamamen yazılımsal — borsaya HİÇBİR koşullu emir gönderilmiyor (max {MAX_OPEN_POSITIONS} pozisyon).\n"
         f"Kaldıraç: {TP_LEVERAGE}x\n"
         f"{len(recovered)} açık pozisyon geri yüklendi.{halt_note}"
