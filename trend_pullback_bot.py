@@ -20,6 +20,7 @@ SIFIRDAN TEMIZ KURULUM v2 (2026-07-27, Gemini'nin 4 katmanli mimarisi)
 """
 
 import os
+import re
 import csv
 import json
 import sys
@@ -140,6 +141,8 @@ def process_telegram_updates():
             send_telegram_message(build_orders_message())
         elif text.startswith("/regime"):
             send_telegram_message(build_regime_message())
+        elif text.startswith("/rapor"):
+            send_telegram_message(build_stop_analysis_message())
 
 
 def _cancel_all_open_orders_for_symbol(symbol: str) -> int:
@@ -353,7 +356,13 @@ POSITION_FIELDNAMES = [
     "engine", "original_qty", "exchange_stop_order_id", "exchange_tp_order_id",
     "stop_missing_count",
 ]
-CLOSED_TRADE_FIELDNAMES = ["timestamp", "symbol", "direction", "entry_price", "exit_price", "pct_change", "reason"]
+# DERS (2026-08-03): eskiden sadece kapanis zamani kaydediliyordu; motor adi
+# ise "reason" metninin icine gomuluydu. Bu yuzden "stoplar acilistan ne kadar
+# sonra geliyor" ve "hangi motor kac stop yedi" sorulari GECMIS VERIDEN
+# cevaplanamiyordu. Artik motor, giris zamani ve sure ayri sutunlar.
+CLOSED_TRADE_FIELDNAMES = ["timestamp", "symbol", "direction", "engine",
+                           "entry_time", "duration_min", "entry_price",
+                           "exit_price", "pct_change", "reason"]
 
 COINS = [
     "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "AVAX", "LINK", "ADA", "SUI",
@@ -926,7 +935,15 @@ def _effective_risk_pct():
     return _current_risk_pct * _portfolio_risk_multiplier()
 
 
-def log_closed_trade(symbol, direction, entry_price, exit_price, pct_change, reason):
+def log_closed_trade(symbol, direction, entry_price, exit_price, pct_change, reason,
+                     engine="?", entry_time=""):
+    duration_min = ""
+    if entry_time:
+        try:
+            delta = datetime.now() - datetime.fromisoformat(entry_time)
+            duration_min = f"{delta.total_seconds() / 60:.1f}"
+        except Exception:
+            pass
     is_new = not os.path.isfile(CLOSED_TRADES_FILE)
     with open(CLOSED_TRADES_FILE, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CLOSED_TRADE_FIELDNAMES)
@@ -934,6 +951,7 @@ def log_closed_trade(symbol, direction, entry_price, exit_price, pct_change, rea
             writer.writeheader()
         writer.writerow({
             "timestamp": datetime.now().isoformat(), "symbol": symbol, "direction": direction,
+            "engine": engine, "entry_time": entry_time, "duration_min": duration_min,
             "entry_price": entry_price, "exit_price": exit_price,
             "pct_change": f"{pct_change:.3f}", "reason": reason,
         })
@@ -1150,7 +1168,8 @@ def update_positions():
             raw_pct = (exit_price - entry_price) / entry_price * 100
             pct_change = raw_pct if direction == "LONG" else -raw_pct
             log_closed_trade(symbol, direction, entry_price, exit_price, pct_change,
-                             f"Borsa tetikledi ({engine})")
+                             f"Borsa tetikledi ({engine})",
+                             engine=engine, entry_time=r.get("entry_time", ""))
             send_telegram_message(
                 f"🔔 {symbol} {direction} pozisyon KAPANDI (borsa tetikledi, motor: {engine}).\n"
                 f"Giriş: {entry_price:.6f} | Çıkış (yaklaşık): {exit_price:.6f} | Değişim: {pct_change:+.2f}%"
@@ -1184,7 +1203,8 @@ def update_positions():
                 else:
                     reason = f"TP 1:{TP_RR_RATIO:g} (yazılımsal, {engine})"
                     emoji, baslik = "🎯", "HEDEF (TP)"
-                log_closed_trade(symbol, direction, entry_price, price, pct_change, reason)
+                log_closed_trade(symbol, direction, entry_price, price, pct_change, reason,
+                                 engine=engine, entry_time=r.get("entry_time", ""))
                 send_telegram_message(
                     f"{emoji} {symbol} {direction} pozisyon kapandı — {baslik} | motor: {engine}\n"
                     f"Giriş: {entry_price:.6f} | Çıkış: {price:.6f} | Değişim: {pct_change:+.2f}%"
@@ -1313,6 +1333,112 @@ def build_orders_message():
     lines = [f"📋 Toplam {len(all_orders)} açık emir:"]
     for o in all_orders:
         lines.append(f"  {o.get('symbol')}: {o.get('type')} @ {o.get('stopPrice') or o.get('price')}")
+    return "\n".join(lines)
+
+
+def build_stop_analysis_message():
+    """STOP ANALITIK RAPORU (/rapor) — yon / motor / zamanlama kirilimi.
+    Kaynak closed_trades.csv'dir; positions.csv DEGIL (o sadece hala ACIK
+    pozisyonlari tutar, kapanan islem oraya hic yazilmaz)."""
+    if not os.path.isfile(CLOSED_TRADES_FILE):
+        return "📊 Henüz kapanmış işlem kaydı yok."
+    with open(CLOSED_TRADES_FILE, newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return "📊 Henüz kapanmış işlem kaydı yok."
+
+    def engine_of(r):
+        eng = (r.get("engine") or "").strip()
+        if eng and eng != "?":
+            return eng
+        # Eski kayitlarda motor adi ayri sutun degil, reason metninin icinde.
+        m = re.search(r"(BREAKOUT|LIKIDITE|H4_SWING)", r.get("reason", ""))
+        return m.group(1) if m else "BİLİNMİYOR"
+
+    def outcome_of(r):
+        # Kapanis SEBEBINE bakiyoruz, pct isaretine degil - zaman asimi veya
+        # borsa tetiklemesi de kar/zarar uretebilir, onlari stop saymak yanlis.
+        reason = (r.get("reason") or "").lower()
+        if "stop" in reason:
+            return "STOP"
+        if "tp" in reason or "hedef" in reason:
+            return "TP"
+        return "DİĞER"
+
+    def pctf(a, b):
+        return f"%{a / b * 100:.1f}" if b else "-"
+
+    def net_of(rs):
+        total = 0.0
+        for r in rs:
+            try:
+                total += float(r["pct_change"])
+            except (TypeError, ValueError):
+                pass
+        return total
+
+    stops = [r for r in rows if outcome_of(r) == "STOP"]
+    tps = [r for r in rows if outcome_of(r) == "TP"]
+    decided = len(stops) + len(tps)
+    lines = ["📊 [STOP ANALİTİK RAPORU]", ""]
+    lines.append(f"Toplam: {len(rows)} işlem | TP: {len(tps)} | STOP: {len(stops)} | "
+                 f"diğer: {len(rows) - decided}")
+    lines.append(f"İsabet: {pctf(len(tps), decided)} | Net: {net_of(rows):+.2f}%")
+    if decided:
+        wr = len(tps) / decided
+        lines.append(f"Beklenti: {wr * TP_RR_RATIO - (1 - wr):+.3f}R/işlem "
+                     f"(1:{TP_RR_RATIO:g} R:R'de başabaş isabet: "
+                     f"%{100 / (1 + TP_RR_RATIO):.1f})")
+
+    def group_block(title, keyfn):
+        groups = {}
+        for r in rows:
+            groups.setdefault(keyfn(r), []).append(r)
+        out = ["", title]
+        for k in sorted(groups):
+            g = groups[k]
+            s = sum(1 for r in g if outcome_of(r) == "STOP")
+            t = sum(1 for r in g if outcome_of(r) == "TP")
+            out.append(f"  {k}: {len(g)} işlem | TP {t} | STOP {s} | "
+                       f"isabet {pctf(t, s + t)} | net {net_of(g):+.2f}%")
+        return out, groups
+
+    dir_lines, _ = group_block("1️⃣ YÖN", lambda r: r["direction"])
+    lines += dir_lines
+    ls = sum(1 for r in stops if r["direction"] == "LONG")
+    lines.append(f"  → Stop olan {len(stops)} işlemin {ls}'i LONG, {len(stops) - ls}'i SHORT.")
+
+    eng_lines, eng_groups = group_block("2️⃣ MOTOR", engine_of)
+    lines += eng_lines
+    if eng_groups:
+        worst = min(eng_groups, key=lambda k: net_of(eng_groups[k]))
+        lines.append(f"  → En çok zarar yazan: {worst} ({net_of(eng_groups[worst]):+.2f}%)")
+
+    lines.append("")
+    lines.append("3️⃣ STOP ZAMANLAMASI")
+    durs = []
+    for r in stops:
+        d = (r.get("duration_min") or "").strip()
+        if d:
+            try:
+                durs.append(float(d))
+            except ValueError:
+                pass
+    if not durs:
+        lines.append("  ⚠️ Süre verisi yok — eski kayıtlarda giriş zamanı")
+        lines.append("  tutulmuyordu. Bundan sonraki kapanışlarda dolacak.")
+    else:
+        durs.sort()
+        quick = sum(1 for d in durs if d <= 30)
+        lines.append(f"  Ortanca: {durs[len(durs) // 2]:.0f} dk | "
+                     f"En hızlı: {durs[0]:.0f} | En yavaş: {durs[-1]:.0f}")
+        lines.append(f"  ≤30 dk: {quick}/{len(durs)} → iğne stopu göstergesi")
+        lines.append(f"  >30 dk: {len(durs) - quick}/{len(durs)} → yön hatası göstergesi")
+
+    if len(rows) < 30:
+        lines.append("")
+        lines.append(f"ℹ️ Sadece {len(rows)} işlem var — motor bazlı sonuçlar "
+                     f"şans eseri çıkmış olabilir, güvenilir değil.")
     return "\n".join(lines)
 
 
